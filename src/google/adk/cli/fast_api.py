@@ -209,7 +209,7 @@ def get_fast_api_app(
     port: int = 8000,
     trace_to_cloud: bool = False,
     lifespan: Optional[Lifespan[FastAPI]] = None,
-) -> FastAPI:
+) -> tuple[FastAPI, dict[str, Runner], AgentLoader]:
   # InMemory tracing dict.
   trace_dict: dict[str, Any] = {}
   session_trace_dict: dict[str, Any] = {}
@@ -987,4 +987,4 @@ def get_fast_api_app(
         StaticFiles(directory=ANGULAR_DIST_PATH, html=True),
         name="static",
     )
-  return app
+  return app, runner_dict, agent_loader
