@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import datetime
+from datetime import timezone
 import enum
 
-from google.adk.events import Event
-from google.adk.events import EventActions
-from google.adk.sessions import DatabaseSessionService
-from google.adk.sessions import InMemorySessionService
+from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
 from google.adk.sessions.base_session_service import GetSessionConfig
+from google.adk.sessions.database_session_service import DatabaseSessionService
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
 import pytest
 
@@ -66,10 +68,17 @@ async def test_create_get_session(service_type):
   assert session.id
   assert session.state == state
   assert (
-      await session_service.get_session(
-          app_name=app_name, user_id=user_id, session_id=session.id
-      )
-      == session
+      session.last_update_time
+      <= datetime.now().astimezone(timezone.utc).timestamp()
+  )
+
+  got_session = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=session.id
+  )
+  assert got_session == session
+  assert (
+      got_session.last_update_time
+      <= datetime.now().astimezone(timezone.utc).timestamp()
   )
 
   session_id = session.id
@@ -117,6 +126,7 @@ async def test_session_state(service_type):
   app_name = 'my_app'
   user_id_1 = 'user1'
   user_id_2 = 'user2'
+  user_id_malicious = 'malicious'
   session_id_11 = 'session11'
   session_id_12 = 'session12'
   session_id_2 = 'session2'
@@ -137,6 +147,10 @@ async def test_session_state(service_type):
   )
   await session_service.create_session(
       app_name=app_name, user_id=user_id_2, session_id=session_id_2
+  )
+
+  await session_service.create_session(
+      app_name=app_name, user_id=user_id_malicious, session_id=session_id_11
   )
 
   assert session_11.state.get('key11') == 'value11'
@@ -186,6 +200,13 @@ async def test_session_state(service_type):
   assert session_11.state.get('key11') == 'value11_new'
   assert session_11.state.get('user:key1') == 'value1'
   assert not session_11.state.get('temp:key')
+
+  # Make sure a malicious user cannot obtain a session and events not belonging to them
+  session_mismatch = await session_service.get_session(
+      app_name=app_name, user_id=user_id_malicious, session_id=session_id_11
+  )
+
+  assert len(session_mismatch.events) == 0
 
 
 @pytest.mark.asyncio

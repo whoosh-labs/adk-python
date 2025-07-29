@@ -17,13 +17,16 @@
 from __future__ import annotations
 
 from typing import AsyncGenerator
+from typing import Type
 
 from typing_extensions import override
 
-from ..agents.invocation_context import InvocationContext
 from ..events.event import Event
+from ..utils.feature_decorator import working_in_progress
 from .base_agent import BaseAgent
+from .invocation_context import InvocationContext
 from .llm_agent import LlmAgent
+from .sequential_agent_config import SequentialAgentConfig
 
 
 class SequentialAgent(BaseAgent):
@@ -60,7 +63,7 @@ class SequentialAgent(BaseAgent):
         Signals that the model has successfully completed the user's question
         or task.
         """
-        return "Task completion signaled."
+        return 'Task completion signaled.'
 
       if isinstance(sub_agent, LlmAgent):
         # Use function name to dedupe.
@@ -74,3 +77,13 @@ class SequentialAgent(BaseAgent):
     for sub_agent in self.sub_agents:
       async for event in sub_agent.run_live(ctx):
         yield event
+
+  @classmethod
+  @override
+  @working_in_progress('SequentialAgent.from_config is not ready for use.')
+  def from_config(
+      cls: Type[SequentialAgent],
+      config: SequentialAgentConfig,
+      config_abs_path: str,
+  ) -> SequentialAgent:
+    return super().from_config(config, config_abs_path)

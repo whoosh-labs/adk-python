@@ -15,7 +15,7 @@
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.loop_agent import LoopAgent
 from google.adk.agents.sequential_agent import SequentialAgent
-from google.adk.tools import exit_loop
+from google.adk.tools.exit_loop_tool import exit_loop
 from google.genai.types import Part
 
 from ... import testing_utils
@@ -303,11 +303,9 @@ def test_auto_to_loop():
               name='exit_loop', response={'result': None}
           ),
       ),
-      # root_agent summarizes.
-      ('root_agent', 'response4'),
   ]
 
   # root_agent should still be the current agent because sub_agent_1 is loop.
   assert testing_utils.simplify_events(runner.run('test2')) == [
-      ('root_agent', 'response5'),
+      ('root_agent', 'response4'),
   ]

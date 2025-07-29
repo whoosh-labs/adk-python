@@ -22,11 +22,13 @@ import os
 import sys
 from typing import AsyncGenerator
 from typing import cast
+from typing import Optional
 from typing import TYPE_CHECKING
 from typing import Union
 
 from google.genai import Client
 from google.genai import types
+from google.genai.types import FinishReason
 from typing_extensions import override
 
 from .. import version
@@ -56,6 +58,23 @@ class Gemini(BaseLlm):
 
   model: str = 'gemini-1.5-flash'
 
+  retry_options: Optional[types.HttpRetryOptions] = None
+  """Allow Gemini to retry failed responses.
+
+  Sample:
+  ```python
+  from google.genai import types
+
+  # ...
+
+  agent = Agent(
+    model=Gemini(
+      retry_options=types.HttpRetryOptions(initial_delay=1, attempts=2),
+    )
+  )
+  ```
+  """
+
   @staticmethod
   @override
   def supported_models() -> list[str]:
@@ -67,6 +86,8 @@ class Gemini(BaseLlm):
 
     return [
         r'gemini-.*',
+        # model optimizer pattern
+        r'model-optimizer-.*',
         # fine-tuned vertex endpoint pattern
         r'projects\/.+\/locations\/.+\/endpoints\/.+',
         # vertex gemini long name
@@ -85,7 +106,7 @@ class Gemini(BaseLlm):
     Yields:
       LlmResponse: The model response.
     """
-    self._preprocess_request(llm_request)
+    await self._preprocess_request(llm_request)
     self._maybe_append_user_content(llm_request)
     logger.info(
         'Sending out request, model: %s, backend: %s, stream: %s',
@@ -93,7 +114,7 @@ class Gemini(BaseLlm):
         self._api_backend,
         stream,
     )
-    logger.info(_build_request_log(llm_request))
+    logger.debug(_build_request_log(llm_request))
 
     # add tracking headers to custom headers given it will override the headers
     # set in the api client constructor
@@ -118,7 +139,7 @@ class Gemini(BaseLlm):
       # previous partial content. The only difference is bidi rely on
       # complete_turn flag to detect end while sse depends on finish_reason.
       async for response in responses:
-        logger.info(_build_response_log(response))
+        logger.debug(_build_response_log(response))
         llm_response = LlmResponse.create(response)
         usage_metadata = llm_response.usage_metadata
         if (
@@ -150,12 +171,10 @@ class Gemini(BaseLlm):
           thought_text = ''
           text = ''
         yield llm_response
-      if (
-          (text or thought_text)
-          and response
-          and response.candidates
-          and response.candidates[0].finish_reason == types.FinishReason.STOP
-      ):
+
+      # generate an aggregated content at the end regardless the
+      # response.candidates[0].finish_reason
+      if (text or thought_text) and response and response.candidates:
         parts = []
         if thought_text:
           parts.append(types.Part(text=thought_text, thought=True))
@@ -163,6 +182,12 @@ class Gemini(BaseLlm):
           parts.append(types.Part.from_text(text=text))
         yield LlmResponse(
             content=types.ModelContent(parts=parts),
+            error_code=None
+            if response.candidates[0].finish_reason == FinishReason.STOP
+            else response.candidates[0].finish_reason,
+            error_message=None
+            if response.candidates[0].finish_reason == FinishReason.STOP
+            else response.candidates[0].finish_message,
             usage_metadata=usage_metadata,
         )
 
@@ -172,7 +197,8 @@ class Gemini(BaseLlm):
           contents=llm_request.contents,
           config=llm_request.config,
       )
-      logger.info(_build_response_log(response))
+      logger.info('Response received from the model.')
+      logger.debug(_build_response_log(response))
       yield LlmResponse.create(response)
 
   @cached_property
@@ -183,7 +209,10 @@ class Gemini(BaseLlm):
       The api client.
     """
     return Client(
-        http_options=types.HttpOptions(headers=self._tracking_headers)
+        http_options=types.HttpOptions(
+            headers=self._tracking_headers,
+            retry_options=self.retry_options,
+        )
     )
 
   @cached_property
@@ -262,7 +291,22 @@ class Gemini(BaseLlm):
     ) as live_session:
       yield GeminiLlmConnection(live_session)
 
-  def _preprocess_request(self, llm_request: LlmRequest) -> None:
+  async def _adapt_computer_use_tool(self, llm_request: LlmRequest) -> None:
+    """Adapt the google computer use predefined functions to the adk computer use toolset."""
+
+    from ..tools.computer_use.computer_use_toolset import ComputerUseToolset
+
+    async def convert_wait_to_wait_5_seconds(wait_func):
+      async def wait_5_seconds():
+        return await wait_func(5)
+
+      return wait_5_seconds
+
+    await ComputerUseToolset.adapt_computer_use_tool(
+        'wait', convert_wait_to_wait_5_seconds, llm_request
+    )
+
+  async def _preprocess_request(self, llm_request: LlmRequest) -> None:
 
     if self._api_backend == GoogleLLMVariant.GEMINI_API:
       # Using API key from Google AI Studio to call model doesn't support labels.
@@ -276,6 +320,18 @@ class Gemini(BaseLlm):
           for part in content.parts:
             _remove_display_name_if_present(part.inline_data)
             _remove_display_name_if_present(part.file_data)
+
+    # Initialize config if needed
+    if llm_request.config and llm_request.config.tools:
+      # Check if computer use is configured
+      for tool in llm_request.config.tools:
+        if (
+            isinstance(tool, (types.Tool, types.ToolDict))
+            and hasattr(tool, 'computer_use')
+            and tool.computer_use
+        ):
+          llm_request.config.system_instruction = None
+          await self._adapt_computer_use_tool(llm_request)
 
 
 def _build_function_declaration_log(

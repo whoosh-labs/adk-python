@@ -13,10 +13,14 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
+import os
+from pathlib import Path
+import sys
+import tempfile
 import time
 from typing import Any
-from typing import Optional
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -28,7 +32,8 @@ from google.adk.evaluation.eval_case import EvalCase
 from google.adk.evaluation.eval_case import Invocation
 from google.adk.evaluation.eval_result import EvalSetResult
 from google.adk.evaluation.eval_set import EvalSet
-from google.adk.events import Event
+from google.adk.evaluation.in_memory_eval_sets_manager import InMemoryEvalSetsManager
+from google.adk.events.event import Event
 from google.adk.runners import Runner
 from google.adk.sessions.base_session_service import ListSessionsResponse
 from google.genai import types
@@ -184,6 +189,9 @@ def mock_agent_loader():
     def load_agent(self, app_name):
       return root_agent
 
+    def list_agents(self):
+      return ["test_app"]
+
   return MockAgentLoader(".")
 
 
@@ -326,49 +334,7 @@ def mock_memory_service():
 @pytest.fixture
 def mock_eval_sets_manager():
   """Create a mock eval sets manager."""
-
-  # Storage for eval sets.
-  eval_sets = {}
-
-  class MockEvalSetsManager:
-    """Mock eval sets manager."""
-
-    def create_eval_set(self, app_name, eval_set_id):
-      """Create an eval set."""
-      if app_name not in eval_sets:
-        eval_sets[app_name] = {}
-
-      if eval_set_id in eval_sets[app_name]:
-        raise ValueError(f"Eval set {eval_set_id} already exists.")
-
-      eval_sets[app_name][eval_set_id] = EvalSet(
-          eval_set_id=eval_set_id, eval_cases=[]
-      )
-      return eval_set_id
-
-    def get_eval_set(self, app_name, eval_set_id):
-      """Get an eval set."""
-      if app_name not in eval_sets:
-        raise ValueError(f"App {app_name} not found.")
-      if eval_set_id not in eval_sets[app_name]:
-        raise ValueError(f"Eval set {eval_set_id} not found in app {app_name}.")
-      return eval_sets[app_name][eval_set_id]
-
-    def list_eval_sets(self, app_name):
-      """List eval sets."""
-      if app_name not in eval_sets:
-        raise ValueError(f"App {app_name} not found.")
-      return list(eval_sets[app_name].keys())
-
-    def add_eval_case(self, app_name, eval_set_id, eval_case):
-      """Add an eval case to an eval set."""
-      if app_name not in eval_sets:
-        raise ValueError(f"App {app_name} not found.")
-      if eval_set_id not in eval_sets[app_name]:
-        raise ValueError(f"Eval set {eval_set_id} not found in app {app_name}.")
-      eval_sets[app_name][eval_set_id].eval_cases.append(eval_case)
-
-  return MockEvalSetsManager()
+  return InMemoryEvalSetsManager()
 
 
 @pytest.fixture
@@ -465,6 +431,9 @@ def test_app(
         artifact_service_uri="",
         memory_service_uri="",
         allow_origins=["*"],
+        a2a=False,  # Disable A2A for most tests
+        host="127.0.0.1",
+        port=8000,
     )
 
     # Create a TestClient that doesn't start a real server
@@ -518,6 +487,134 @@ async def create_test_eval_set(
       eval_case=test_eval_case,
   )
   return test_session_info
+
+
+@pytest.fixture
+@pytest.mark.skipif(
+    sys.version_info < (3, 10), reason="A2A requires Python 3.10+"
+)
+def temp_agents_dir_with_a2a():
+  """Create a temporary agents directory with A2A agent configurations for testing."""
+  with tempfile.TemporaryDirectory() as temp_dir:
+    # Create test agent directory
+    agent_dir = Path(temp_dir) / "test_a2a_agent"
+    agent_dir.mkdir()
+
+    # Create agent.json file
+    agent_card = {
+        "name": "test_a2a_agent",
+        "description": "Test A2A agent",
+        "version": "1.0.0",
+        "author": "test",
+        "capabilities": ["text"],
+    }
+
+    with open(agent_dir / "agent.json", "w") as f:
+      json.dump(agent_card, f)
+
+    # Create a simple agent.py file
+    agent_py_content = """
+from google.adk.agents.base_agent import BaseAgent
+
+class TestA2AAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="test_a2a_agent")
+"""
+
+    with open(agent_dir / "agent.py", "w") as f:
+      f.write(agent_py_content)
+
+    yield temp_dir
+
+
+@pytest.fixture
+@pytest.mark.skipif(
+    sys.version_info < (3, 10), reason="A2A requires Python 3.10+"
+)
+def test_app_with_a2a(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    temp_agents_dir_with_a2a,
+):
+  """Create a TestClient for the FastAPI app with A2A enabled."""
+
+  # Mock A2A related classes
+  with (
+      patch("signal.signal", return_value=None),
+      patch(
+          "google.adk.cli.fast_api.InMemorySessionService",
+          return_value=mock_session_service,
+      ),
+      patch(
+          "google.adk.cli.fast_api.InMemoryArtifactService",
+          return_value=mock_artifact_service,
+      ),
+      patch(
+          "google.adk.cli.fast_api.InMemoryMemoryService",
+          return_value=mock_memory_service,
+      ),
+      patch(
+          "google.adk.cli.fast_api.AgentLoader",
+          return_value=mock_agent_loader,
+      ),
+      patch(
+          "google.adk.cli.fast_api.LocalEvalSetsManager",
+          return_value=mock_eval_sets_manager,
+      ),
+      patch(
+          "google.adk.cli.fast_api.LocalEvalSetResultsManager",
+          return_value=mock_eval_set_results_manager,
+      ),
+      patch(
+          "google.adk.cli.cli_eval.run_evals",
+          new=mock_run_evals_for_fast_api,
+      ),
+      patch("a2a.server.tasks.InMemoryTaskStore") as mock_task_store,
+      patch(
+          "google.adk.a2a.executor.a2a_agent_executor.A2aAgentExecutor"
+      ) as mock_executor,
+      patch(
+          "a2a.server.request_handlers.DefaultRequestHandler"
+      ) as mock_handler,
+      patch("a2a.server.apps.A2AStarletteApplication") as mock_a2a_app,
+  ):
+    # Configure mocks
+    mock_task_store.return_value = MagicMock()
+    mock_executor.return_value = MagicMock()
+    mock_handler.return_value = MagicMock()
+
+    # Mock A2AStarletteApplication
+    mock_app_instance = MagicMock()
+    mock_app_instance.routes.return_value = (
+        []
+    )  # Return empty routes for testing
+    mock_a2a_app.return_value = mock_app_instance
+
+    # Change to temp directory
+    original_cwd = os.getcwd()
+    os.chdir(temp_agents_dir_with_a2a)
+
+    try:
+      app = get_fast_api_app(
+          agents_dir=".",
+          web=True,
+          session_service_uri="",
+          artifact_service_uri="",
+          memory_service_uri="",
+          allow_origins=["*"],
+          a2a=True,
+          host="127.0.0.1",
+          port=8000,
+      )
+
+      client = TestClient(app)
+      yield client
+    finally:
+      os.chdir(original_cwd)
 
 
 #################################################
@@ -748,6 +845,23 @@ def test_run_eval(test_app, create_test_eval_set):
   assert data == [f"{info['app_name']}_test_eval_set_id_eval_result"]
 
 
+def test_list_eval_metrics(test_app):
+  """Test listing eval metrics."""
+  url = "/apps/test_app/eval_metrics"
+  response = test_app.get(url)
+
+  # Verify the response
+  assert response.status_code == 200
+  data = response.json()
+  assert isinstance(data, list)
+  # Add more assertions based on the expected metrics
+  assert len(data) > 0
+  for metric in data:
+    assert "metricName" in metric
+    assert "description" in metric
+    assert "metricValueInfo" in metric
+
+
 def test_debug_trace(test_app):
   """Test the debug trace endpoint."""
   # This test will likely return 404 since we haven't set up trace data,
@@ -758,6 +872,29 @@ def test_debug_trace(test_app):
   # Verify we get a 404 for a nonexistent trace
   assert response.status_code == 404
   logger.info("Debug trace test completed successfully")
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10), reason="A2A requires Python 3.10+"
+)
+def test_a2a_agent_discovery(test_app_with_a2a):
+  """Test that A2A agents are properly discovered and configured."""
+  # This test mainly verifies that the A2A setup doesn't break the app
+  response = test_app_with_a2a.get("/list-apps")
+  assert response.status_code == 200
+  logger.info("A2A agent discovery test passed")
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10), reason="A2A requires Python 3.10+"
+)
+def test_a2a_disabled_by_default(test_app):
+  """Test that A2A functionality is disabled by default."""
+  # The regular test_app fixture has a2a=False
+  # This test ensures no A2A routes are added
+  response = test_app.get("/list-apps")
+  assert response.status_code == 200
+  logger.info("A2A disabled by default test passed")
 
 
 if __name__ == "__main__":
