@@ -21,10 +21,10 @@ from typing import Tuple
 from unittest import mock
 
 from dateutil.parser import isoparse
-from google.adk.events import Event
-from google.adk.events import EventActions
-from google.adk.sessions import Session
-from google.adk.sessions import VertexAiSessionService
+from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
+from google.adk.sessions.session import Session
+from google.adk.sessions.vertex_ai_session_service import VertexAiSessionService
 from google.genai import types
 import pytest
 
@@ -201,7 +201,13 @@ class MockApiClient:
         if match:
           session_id = match.group(2)
           if match.group(3):
-            return {'sessionEvents': MOCK_EVENT_JSON_3}
+            page_token = match.group(3)
+            if page_token == 'my_token':
+              response = {'sessionEvents': MOCK_EVENT_JSON_3}
+              response['nextPageToken'] = 'my_token2'
+              return response
+            else:
+              return {}
           events_tuple = self.event_dict.get(session_id, ([], None))
           response = {'sessionEvents': events_tuple[0]}
           if events_tuple[1]:
@@ -290,6 +296,21 @@ async def test_get_empty_session(agent_engine_id):
         app_name='123', user_id='user', session_id='0'
     )
   assert str(excinfo.value) == 'Session not found: 0'
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+@pytest.mark.parametrize('agent_engine_id', [None, '123'])
+async def test_get_another_user_session(agent_engine_id):
+  if agent_engine_id:
+    session_service = mock_vertex_ai_session_service(agent_engine_id)
+  else:
+    session_service = mock_vertex_ai_session_service()
+  with pytest.raises(ValueError) as excinfo:
+    await session_service.get_session(
+        app_name='123', user_id='user2', session_id='1'
+    )
+  assert str(excinfo.value) == 'Session not found: 1'
 
 
 @pytest.mark.asyncio

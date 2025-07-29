@@ -14,10 +14,10 @@
 
 import os
 
-from google.adk.agents import llm_agent
-from google.adk.auth import AuthCredentialTypes
-from google.adk.tools.bigquery import BigQueryCredentialsConfig
-from google.adk.tools.bigquery import BigQueryToolset
+from google.adk.agents.llm_agent import LlmAgent
+from google.adk.auth.auth_credential import AuthCredentialTypes
+from google.adk.tools.bigquery.bigquery_credentials import BigQueryCredentialsConfig
+from google.adk.tools.bigquery.bigquery_toolset import BigQueryToolset
 from google.adk.tools.bigquery.config import BigQueryToolConfig
 from google.adk.tools.bigquery.config import WriteMode
 import google.auth
@@ -26,7 +26,11 @@ import google.auth
 CREDENTIALS_TYPE = AuthCredentialTypes.OAUTH2
 
 
-# Define BigQuery tool config
+# Define BigQuery tool config with write mode set to allowed. Note that this is
+# only to demonstrate the full capability of the BigQuery tools. In production
+# you may want to change to BLOCKED (default write mode, effectively makes the
+# tool read-only) or PROTECTED (only allows writes in the anonymous dataset of a
+# BigQuery session) write mode.
 tool_config = BigQueryToolConfig(write_mode=WriteMode.ALLOWED)
 
 if CREDENTIALS_TYPE == AuthCredentialTypes.OAUTH2:
@@ -58,7 +62,7 @@ bigquery_toolset = BigQueryToolset(
 
 # The variable name `root_agent` determines what your root agent is for the
 # debug CLI
-root_agent = llm_agent.Agent(
+root_agent = LlmAgent(
     model="gemini-2.0-flash",
     name="bigquery_agent",
     description=(
