@@ -230,7 +230,7 @@ class AdkWebServer:
       *,
       agent_loader: BaseAgentLoader,
       session_service: BaseSessionService,
-      memory_service: BaseMemoryService,
+      memory_service: BaseMemoryService | SharedValue[BaseMemoryService],  # Accept either direct service or shared reference
       artifact_service: BaseArtifactService,
       credential_service: BaseCredentialService,
       eval_sets_manager: EvalSetsManager,
@@ -250,6 +250,13 @@ class AdkWebServer:
     self.current_app_name_ref: SharedValue[str] = SharedValue(value="")
     self.runner_dict = {}
 
+  @property
+  def current_memory_service(self) -> BaseMemoryService:
+    """Get the current memory service, handling both direct and shared references."""
+    if isinstance(self.memory_service, SharedValue):
+      return self.memory_service.value
+    return self.memory_service
+
   async def get_runner_async(self, app_name: str) -> Runner:
     """Returns the runner for the given app."""
     if app_name in self.runners_to_clean:
@@ -259,14 +266,18 @@ class AdkWebServer:
 
     envs.load_dotenv_for_agent(os.path.basename(app_name), self.agents_dir)
     if app_name in self.runner_dict:
-      return self.runner_dict[app_name]
+      # Update existing runner with new memory service if needed
+      runner = self.runner_dict[app_name]
+      runner.memory_service = self.current_memory_service
+      return runner
+    
     root_agent = self.agent_loader.load_agent(app_name)
     runner = Runner(
         app_name=app_name,
         agent=root_agent,
         artifact_service=self.artifact_service,
         session_service=self.session_service,
-        memory_service=self.memory_service,
+        memory_service=self.current_memory_service,  # Use the current memory service
         credential_service=self.credential_service,
     )
     self.runner_dict[app_name] = runner

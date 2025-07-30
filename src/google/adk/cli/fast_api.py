@@ -49,6 +49,7 @@ from .utils import envs
 from .utils import evals
 from .utils.agent_change_handler import AgentChangeEventHandler
 from .utils.agent_loader import AgentLoader
+from .utils.shared_value import SharedValue
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -135,6 +136,9 @@ def get_fast_api_app(
   else:
     memory_service = InMemoryMemoryService()
 
+  # Create a shared reference to the memory service for hot reloading
+  memory_service_ref = SharedValue(value=memory_service)
+
   # Build the Session service
   if session_service_uri:
     if session_service_uri.startswith("agentengine://"):
@@ -180,8 +184,8 @@ def get_fast_api_app(
   adk_web_server = AdkWebServer(
       agent_loader=agent_loader,
       session_service=session_service,
+      memory_service=memory_service_ref,  # Pass the shared reference
       artifact_service=artifact_service,
-      memory_service=memory_service,
       credential_service=credential_service,
       eval_sets_manager=eval_sets_manager,
       eval_set_results_manager=eval_set_results_manager,
@@ -218,6 +222,8 @@ def get_fast_api_app(
           agent_loader=agent_loader,
           runners_to_clean=adk_web_server.runners_to_clean,
           current_app_name_ref=adk_web_server.current_app_name_ref,
+          memory_service_ref=memory_service_ref,  # Pass the same shared reference
+          agents_dir=agents_dir,
       )
       observer.schedule(agent_change_handler, agents_dir, recursive=True)
       observer.start()
