@@ -17,6 +17,7 @@ import copy
 from datetime import datetime
 import json
 import logging
+import os
 from typing import Any
 from typing import Optional
 import uuid
@@ -311,7 +312,35 @@ class DatabaseSessionService(BaseSessionService):
     # 3. Initialize all properties
 
     try:
-      db_engine = create_engine(db_url, **kwargs)
+      # Apply safe defaults unless explicitly provided by caller
+      engine_kwargs: dict[str, Any] = dict(kwargs) if kwargs else {}
+
+      # Health checks and recycling to avoid stale connections
+      engine_kwargs.setdefault("pool_pre_ping", True)
+      # Recycle before common LB/proxy idle timeouts (configurable via env)
+      default_recycle = int(os.environ.get("DB_POOL_RECYCLE_SEC", "600"))
+      engine_kwargs.setdefault("pool_recycle", default_recycle)
+
+      # TCP keepalives for Postgres/psycopg2 to detect half-open sockets
+      if db_url.startswith("postgresql"):
+        connect_args = dict(engine_kwargs.get("connect_args") or {})
+        # Do not override if user supplied their own values
+        connect_args.setdefault("keepalives", 1)
+        connect_args.setdefault(
+            "keepalives_idle", int(os.environ.get("PG_KEEPALIVES_IDLE", "30"))
+        )
+        connect_args.setdefault(
+            "keepalives_interval",
+            int(os.environ.get("PG_KEEPALIVES_INTERVAL", "10")),
+        )
+        connect_args.setdefault(
+            "keepalives_count", int(os.environ.get("PG_KEEPALIVES_COUNT", "5"))
+        )
+        # Enable SSL by default if not specified (safe default for hosted PG)
+        # sslmode can be provided via DB URL or PGSSLMODE env; not set by default here
+        engine_kwargs["connect_args"] = connect_args
+
+      db_engine = create_engine(db_url, **engine_kwargs)
     except Exception as e:
       if isinstance(e, ArgumentError):
         raise ValueError(
