@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from functools import wraps
 import logging
 import os
 from pathlib import Path
@@ -23,9 +24,11 @@ import time
 import traceback
 import typing
 from typing import Any
+from typing import Callable
 from typing import List
 from typing import Literal
 from typing import Optional
+from typing import TypeVar
 
 import click
 from fastapi import FastAPI
@@ -47,6 +50,8 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace import TracerProvider
 from pydantic import Field
 from pydantic import ValidationError
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import OperationalError
 from starlette.types import Lifespan
 from typing_extensions import override
 
@@ -90,6 +95,85 @@ from .utils.agent_loader import AgentLoader
 logger = logging.getLogger("google_adk." + __name__)
 
 _EVAL_SET_FILE_EXTENSION = ".evalset.json"
+
+# Type variable for generic async functions
+T = TypeVar("T")
+
+
+def retry_on_db_error(
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+  """Decorator to retry async functions on database operational errors.
+
+  Specifically handles stale connection errors that occur when:
+  - Connection has been idle and closed by the database server
+  - Network issues cause SSL/TCP connection drops
+  - Connection pool returns a dead connection before pool_pre_ping catches it
+
+  Args:
+    max_retries: Maximum number of retry attempts (default: 3)
+    initial_delay: Initial delay in seconds before first retry (default: 1.0)
+    backoff_factor: Multiplier for delay between retries (default: 2.0)
+
+  Returns:
+    Decorated function that retries on OperationalError and DBAPIError
+  """
+
+  def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+      last_exception = None
+      delay = initial_delay
+
+      for attempt in range(max_retries + 1):
+        try:
+          return await func(*args, **kwargs)
+        except (OperationalError, DBAPIError) as e:
+          last_exception = e
+          error_msg = str(e).lower()
+
+          # Only retry on connection-related errors
+          if any(
+              keyword in error_msg
+              for keyword in [
+                  "eof detected",
+                  "connection",
+                  "broken pipe",
+                  "reset by peer",
+                  "timed out",
+                  "closed",
+              ]
+          ):
+            if attempt < max_retries:
+              logger.warning(
+                  "Database connection error on attempt %d/%d: %s. Retrying in"
+                  " %.2fs...",
+                  attempt + 1,
+                  max_retries + 1,
+                  str(e)[:200],
+                  delay,
+              )
+              await asyncio.sleep(delay)
+              delay *= backoff_factor
+              continue
+
+          # If we shouldn't retry or exhausted retries, re-raise
+          logger.error(
+              "Database error after %d attempts: %s",
+              attempt + 1,
+              str(e),
+          )
+          raise
+
+      # This should never be reached, but just in case
+      if last_exception:
+        raise last_exception
+
+    return wrapper
+
+  return decorator
 
 
 class ApiServerSpanExporter(export.SpanExporter):
@@ -385,6 +469,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
       response_model_exclude_none=True,
   )
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def get_session(
       app_name: str, user_id: str, session_id: str
   ) -> Session:
@@ -399,6 +484,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions",
       response_model_exclude_none=True,
   )
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def list_sessions(app_name: str, user_id: str) -> list[Session]:
     list_sessions_response = await session_service.list_sessions(
         app_name=app_name, user_id=user_id
@@ -414,6 +500,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
       response_model_exclude_none=True,
   )
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def create_session_with_id(
       app_name: str,
       user_id: str,
@@ -439,6 +526,7 @@ def get_fast_api_app(
       "/apps/{app_name}/users/{user_id}/sessions",
       response_model_exclude_none=True,
   )
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def create_session(
       app_name: str,
       user_id: str,
@@ -689,6 +777,7 @@ def get_fast_api_app(
     return eval_set_results_manager.list_eval_set_results(app_name)
 
   @app.delete("/apps/{app_name}/users/{user_id}/sessions/{session_id}")
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def delete_session(app_name: str, user_id: str, session_id: str):
     await session_service.delete_session(
         app_name=app_name, user_id=user_id, session_id=session_id
@@ -777,6 +866,7 @@ def get_fast_api_app(
     )
 
   @app.post("/run", response_model_exclude_none=True)
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def agent_run(req: AgentRunRequest) -> list[Event]:
     session = await session_service.get_session(
         app_name=req.app_name, user_id=req.user_id, session_id=req.session_id
@@ -796,6 +886,7 @@ def get_fast_api_app(
     return events
 
   @app.post("/run_sse")
+  @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def agent_run_sse(req: AgentRunRequest) -> StreamingResponse:
     # SSE endpoint
     session = await session_service.get_session(
