@@ -535,6 +535,7 @@ def get_fast_api_app(
       session_id: str,
       state: Optional[dict[str, Any]] = None,
   ) -> Session:
+    print("Creating session with id: %s", session_id)
     if (
         await session_service.get_session(
             app_name=app_name, user_id=user_id, session_id=session_id
@@ -917,6 +918,7 @@ def get_fast_api_app(
   @retry_on_db_error(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
   async def agent_run_sse(req: AgentRunRequest) -> StreamingResponse:
     # SSE endpoint
+    print("Starting agent run SSE for %s", req.session_id)
     session = await session_service.get_session(
         app_name=req.app_name, user_id=req.user_id, session_id=req.session_id
     )
