@@ -535,7 +535,7 @@ def get_fast_api_app(
       session_id: str,
       state: Optional[dict[str, Any]] = None,
   ) -> Session:
-    print("Creating session with id: %s", session_id)
+    logger.info("Creating session with id: %s", session_id)
     if (
         await session_service.get_session(
             app_name=app_name, user_id=user_id, session_id=session_id
