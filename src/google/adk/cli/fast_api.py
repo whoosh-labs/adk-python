@@ -124,12 +124,38 @@ def retry_on_db_error(
   def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
+      # Log that decorator is active
+      logger.info(
+          "retry_on_db_error: Wrapping call to %s (max_retries=%d, initial_delay=%.1fs)",
+          func.__name__,
+          max_retries,
+          initial_delay,
+      )
+      
       last_exception = None
       delay = initial_delay
 
       for attempt in range(max_retries + 1):
         try:
-          return await func(*args, **kwargs)
+          logger.info(
+              "retry_on_db_error: Attempt %d/%d for %s",
+              attempt + 1,
+              max_retries + 1,
+              func.__name__,
+          )
+          result = await func(*args, **kwargs)
+          
+          # Log successful completion (only if not first attempt)
+          if attempt > 0:
+            logger.info(
+                "retry_on_db_error: SUCCESS on attempt %d/%d for %s",
+                attempt + 1,
+                max_retries + 1,
+                func.__name__,
+            )
+          
+          return result
+          
         except (OperationalError, DBAPIError) as e:
           last_exception = e
           error_msg = str(e).lower()
@@ -148,10 +174,11 @@ def retry_on_db_error(
           ):
             if attempt < max_retries:
               logger.warning(
-                  "Database connection error on attempt %d/%d: %s. Retrying in"
+                  "Database connection error on attempt %d/%d in %s: %s. Retrying in"
                   " %.2fs...",
                   attempt + 1,
                   max_retries + 1,
+                  func.__name__,
                   str(e)[:200],
                   delay,
               )
@@ -161,8 +188,9 @@ def retry_on_db_error(
 
           # If we shouldn't retry or exhausted retries, re-raise
           logger.error(
-              "Database error after %d attempts: %s",
+              "Database error after %d attempts in %s: %s",
               attempt + 1,
+              func.__name__,
               str(e),
           )
           raise
