@@ -125,6 +125,7 @@ def retry_on_db_error(
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
       # Log that decorator is active
+      print(f"RETRY WRAPPER CALLED for {func.__name__}")
       logger.info(
           "retry_on_db_error: Wrapping call to %s (max_retries=%d, initial_delay=%.1fs)",
           func.__name__,
@@ -535,7 +536,8 @@ def get_fast_api_app(
       session_id: str,
       state: Optional[dict[str, Any]] = None,
   ) -> Session:
-    logger.info("Creating session with id: %s", session_id)
+    print(f"INSIDE create_session_with_id: app={app_name}, user={user_id}, session={session_id}")
+    logger.error("Creating session with id: %s", session_id)
     if (
         await session_service.get_session(
             app_name=app_name, user_id=user_id, session_id=session_id
