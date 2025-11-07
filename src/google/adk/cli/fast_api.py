@@ -912,8 +912,17 @@ def get_fast_api_app(
           yield f"data: {sse_event}\n\n"
       except Exception as e:
         logger.exception("Error in event_generator: %s", e)
-        # You might want to yield an error event here
-        yield f'data: {{"error": "{str(e)}"}}\n\n'
+        # Create a proper error event that the frontend can understand
+        error_event = Event(
+            author="system",
+            invocation_id="error",
+            error_code="INTERNAL_ERROR",
+            error_message=str(e),
+            turn_complete=True,
+        )
+        error_sse = error_event.model_dump_json(exclude_none=True, by_alias=True)
+        logger.info("Sending error event to client: %s", error_sse)
+        yield f"data: {error_sse}\n\n"
 
     # Returns a streaming response with the proper media type for SSE
     return StreamingResponse(
