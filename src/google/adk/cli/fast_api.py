@@ -920,7 +920,9 @@ def get_fast_api_app(
             error_message=str(e),
             turn_complete=True,
         )
-        error_sse = error_event.model_dump_json(exclude_none=True, by_alias=True)
+        error_sse = error_event.model_dump_json(
+            exclude_none=True, by_alias=True
+        )
         logger.info("Sending error event to client: %s", error_sse)
         yield f"data: {error_sse}\n\n"
 
