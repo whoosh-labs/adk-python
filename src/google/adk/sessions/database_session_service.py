@@ -19,6 +19,7 @@ from datetime import datetime
 from datetime import timezone
 import json
 import logging
+import os
 from typing import Any
 from typing import Optional
 import uuid
@@ -304,7 +305,39 @@ class DatabaseSessionService(BaseSessionService):
     # 2. Create all tables based on schema
     # 3. Initialize all properties
     try:
-      db_engine = create_async_engine(db_url, **kwargs)
+      # Apply safe defaults unless explicitly provided by caller
+      engine_kwargs: dict[str, Any] = dict(kwargs) if kwargs else {}
+
+      # Health checks and recycling to avoid stale connections
+      engine_kwargs.setdefault("pool_pre_ping", True)
+      # Recycle before common LB/proxy idle timeouts (configurable via env)
+      default_recycle = int(os.environ.get("DB_POOL_RECYCLE_SEC", "600"))
+      engine_kwargs.setdefault("pool_recycle", default_recycle)
+
+      # TCP keepalives for Postgres/psycopg (async) to detect half-open sockets
+      if db_url.startswith("postgresql"):
+        connect_args = dict(engine_kwargs.get("connect_args") or {})
+        # Do not override if user supplied their own values
+        connect_args.setdefault("server_settings", {})
+        # For async connections, we set server_settings for PostgreSQL
+        # Note: For psycopg3 (async), keepalive settings work differently
+        # We'll use the connect_args approach which works with asyncpg too
+        if "keepalives" not in connect_args:
+          connect_args["keepalives"] = 1
+          connect_args["keepalives_idle"] = int(
+              os.environ.get("PG_KEEPALIVES_IDLE", "30")
+          )
+          connect_args["keepalives_interval"] = int(
+              os.environ.get("PG_KEEPALIVES_INTERVAL", "10")
+          )
+          connect_args["keepalives_count"] = int(
+              os.environ.get("PG_KEEPALIVES_COUNT", "5")
+          )
+        # Enable SSL by default if not specified (safe default for hosted PG)
+        # sslmode can be provided via DB URL or PGSSLMODE env; not set by default here
+        engine_kwargs["connect_args"] = connect_args
+
+      db_engine = create_async_engine(db_url, **engine_kwargs)
 
       if db_engine.dialect.name == "sqlite":
         # Set sqlite pragma to enable foreign keys constraints

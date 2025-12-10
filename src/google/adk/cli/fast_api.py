@@ -94,7 +94,7 @@ def get_fast_api_app(
     extra_plugins: Optional[list[str]] = None,
     logo_text: Optional[str] = None,
     logo_image_url: Optional[str] = None,
-) -> FastAPI:
+) -> tuple[FastAPI, dict[str, Runner], AgentLoader]:
 
   # Set up eval managers.
   if eval_storage_uri:
@@ -420,4 +420,4 @@ def get_fast_api_app(
           logger.error("Failed to setup A2A agent %s: %s", app_name, e)
           # Continue with other agents even if one fails
 
-  return app
+  return app, adk_web_server.runner_dict, agent_loader
