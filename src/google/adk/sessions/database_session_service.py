@@ -314,28 +314,19 @@ class DatabaseSessionService(BaseSessionService):
       default_recycle = int(os.environ.get("DB_POOL_RECYCLE_SEC", "600"))
       engine_kwargs.setdefault("pool_recycle", default_recycle)
 
-      # TCP keepalives for Postgres/psycopg (async) to detect half-open sockets
-      if db_url.startswith("postgresql"):
-        connect_args = dict(engine_kwargs.get("connect_args") or {})
-        # Do not override if user supplied their own values
-        connect_args.setdefault("server_settings", {})
-        # For async connections, we set server_settings for PostgreSQL
-        # Note: For psycopg3 (async), keepalive settings work differently
-        # We'll use the connect_args approach which works with asyncpg too
-        if "keepalives" not in connect_args:
-          connect_args["keepalives"] = 1
-          connect_args["keepalives_idle"] = int(
-              os.environ.get("PG_KEEPALIVES_IDLE", "30")
-          )
-          connect_args["keepalives_interval"] = int(
-              os.environ.get("PG_KEEPALIVES_INTERVAL", "10")
-          )
-          connect_args["keepalives_count"] = int(
-              os.environ.get("PG_KEEPALIVES_COUNT", "5")
-          )
-        # Enable SSL by default if not specified (safe default for hosted PG)
-        # sslmode can be provided via DB URL or PGSSLMODE env; not set by default here
-        engine_kwargs["connect_args"] = connect_args
+      # Handle PostgreSQL async driver requirements
+      if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+        # Convert postgresql:// to postgresql+asyncpg:// for async support
+        # asyncpg is the recommended async driver for PostgreSQL with SQLAlchemy
+        if "+" not in db_url:
+          # No explicit driver specified, use asyncpg
+          db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+          db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+
+        # Note: For asyncpg, stale connection prevention is handled by:
+        # 1. pool_pre_ping (set above) - tests connections before use
+        # 2. pool_recycle (set above) - recycles connections periodically
+        # TCP keepalives should be configured at the OS/network level if needed
 
       db_engine = create_async_engine(db_url, **engine_kwargs)
 
