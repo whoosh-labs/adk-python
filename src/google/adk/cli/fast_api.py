@@ -75,6 +75,7 @@ from ..evaluation.gcs_eval_sets_manager import GcsEvalSetsManager
 from ..evaluation.local_eval_set_results_manager import LocalEvalSetResultsManager
 from ..evaluation.local_eval_sets_manager import LocalEvalSetsManager
 from ..events.event import Event
+from ..memory.base_memory_service import BaseMemoryService
 from ..memory.in_memory_memory_service import InMemoryMemoryService
 from ..memory.vertex_ai_memory_bank_service import VertexAiMemoryBankService
 from ..memory.vertex_ai_rag_memory_service import VertexAiRagMemoryService
@@ -293,7 +294,9 @@ def get_fast_api_app(
     port: int = 8000,
     trace_to_cloud: bool = False,
     lifespan: Optional[Lifespan[FastAPI]] = None,
-) -> tuple[FastAPI, dict[str, Runner], AgentLoader]:
+) -> tuple[
+    FastAPI, dict[str, Runner], AgentLoader, dict[str, BaseMemoryService]
+]:
   # InMemory tracing dict.
   trace_dict: dict[str, Any] = {}
   session_trace_dict: dict[str, Any] = {}
@@ -386,7 +389,7 @@ def get_fast_api_app(
       )
   else:
     memory_service = InMemoryMemoryService()
-
+  memory_services = {"memory_service": memory_service}
   # Build the Session service
   if session_service_uri:
     if session_service_uri.startswith("agentengine://"):
@@ -910,6 +913,13 @@ def get_fast_api_app(
           sse_event = event.model_dump_json(exclude_none=True, by_alias=True)
           logger.info("Generated event in agent run streaming: %s", sse_event)
           yield f"data: {sse_event}\n\n"
+
+        session = await session_service.get_session(
+            app_name=req.app_name,
+            user_id=req.user_id,
+            session_id=req.session_id,
+        )
+        await runner.memory_service.add_session_to_memory(session)
       except Exception as e:
         logger.exception("Error in event_generator: %s", e)
         # Create a proper error event that the frontend can understand
@@ -1061,7 +1071,7 @@ def get_fast_api_app(
         agent=root_agent,
         artifact_service=artifact_service,
         session_service=session_service,
-        memory_service=memory_service,
+        memory_service=memory_services["memory_service"],
         credential_service=credential_service,
     )
     runner_dict[app_name] = runner
@@ -1089,4 +1099,4 @@ def get_fast_api_app(
         StaticFiles(directory=ANGULAR_DIST_PATH, html=True),
         name="static",
     )
-  return app, runner_dict, agent_loader
+  return app, runner_dict, agent_loader, memory_services
