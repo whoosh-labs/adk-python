@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,8 @@ def test_list_table_names_success(
   )
   assert result["status"] == "SUCCESS"
   assert result["results"] == ["table1"]
+  mock_database.close.assert_called_once()
+  mock_spanner_client.close.assert_called_once()
 
 
 @patch("google.adk.tools.spanner.client.get_spanner_client")
@@ -193,6 +195,45 @@ def test_list_table_indexes_success(
 
 
 @patch("google.adk.tools.spanner.client.get_spanner_client")
+def test_list_table_indexes_circular_row_fallback_to_string(
+    mock_get_spanner_client, mock_spanner_ids, mock_credentials
+):
+  """Test list_table_indexes stringifies rows with circular references."""
+  mock_spanner_client = MagicMock()
+  mock_instance = MagicMock()
+  mock_database = MagicMock()
+  mock_snapshot = MagicMock()
+  circular_value = []
+  circular_value.append(circular_value)
+  mock_result_set = MagicMock()
+  mock_result_set.__iter__.return_value = iter([(
+      circular_value,
+      "",
+      "PRIMARY_KEY",
+      "",
+      True,
+      False,
+      None,
+  )])
+  mock_snapshot.execute_sql.return_value = mock_result_set
+  mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+  mock_database.database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
+  mock_instance.database.return_value = mock_database
+  mock_spanner_client.instance.return_value = mock_instance
+  mock_get_spanner_client.return_value = mock_spanner_client
+
+  result = metadata_tool.list_table_indexes(
+      mock_spanner_ids["project_id"],
+      mock_spanner_ids["instance_id"],
+      mock_spanner_ids["database_id"],
+      mock_spanner_ids["table_name"],
+      mock_credentials,
+  )
+  assert result["status"] == "SUCCESS"
+  assert isinstance(result["results"][0], str)
+
+
+@patch("google.adk.tools.spanner.client.get_spanner_client")
 def test_list_table_index_columns_success(
     mock_get_spanner_client, mock_spanner_ids, mock_credentials
 ):
@@ -255,3 +296,26 @@ def test_list_named_schemas_success(
   )
   assert result["status"] == "SUCCESS"
   assert result["results"] == ["schema1", "schema2"]
+
+
+@patch("google.adk.tools.spanner.client.get_spanner_client")
+def test_list_table_names_closes_client_after_sdk_error(
+    mock_get_spanner_client, mock_spanner_ids, mock_credentials
+):
+  """The client is released even when the SDK call fails."""
+  mock_spanner_client = MagicMock()
+  mock_spanner_client.instance.side_effect = RuntimeError("request failed")
+  mock_get_spanner_client.return_value = mock_spanner_client
+
+  result = metadata_tool.list_table_names(
+      mock_spanner_ids["project_id"],
+      mock_spanner_ids["instance_id"],
+      mock_spanner_ids["database_id"],
+      mock_credentials,
+  )
+
+  assert result == {
+      "status": "ERROR",
+      "error_details": "request failed",
+  }
+  mock_spanner_client.close.assert_called_once()

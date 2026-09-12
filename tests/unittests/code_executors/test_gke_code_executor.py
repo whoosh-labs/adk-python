@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -60,6 +60,27 @@ def mock_k8s_clients():
     }
 
 
+def mock_pod(name: str = "test-pod-name", exit_code: int | None = None):
+  """Builds a mock Pod, reporting a terminated code container if asked to.
+
+  Args:
+    name: The name of the pod.
+    exit_code: The status the code container terminated with, or None to
+      simulate a pod that reports no terminated container at all.
+  """
+  pod = MagicMock()
+  pod.metadata.name = name
+  if exit_code is None:
+    pod.status.container_statuses = None
+    return pod
+
+  container_status = MagicMock()
+  container_status.name = "code-runner"
+  container_status.state.terminated.exit_code = exit_code
+  pod.status.container_statuses = [container_status]
+  return pod
+
+
 class TestGkeCodeExecutor:
   """Unit tests for the GkeCodeExecutor."""
 
@@ -71,19 +92,74 @@ class TestGkeCodeExecutor:
     assert executor.timeout_seconds == 300
     assert executor.cpu_requested == "200m"
     assert executor.mem_limit == "512Mi"
+    assert executor.executor_type == "job"
 
-  def test_init_with_overrides(self):
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_init_with_overrides(self, mock_sandbox_client):
     """Tests that class attributes can be overridden at instantiation."""
     executor = GkeCodeExecutor(
         namespace="test-ns",
         image="custom-python:latest",
         timeout_seconds=60,
         cpu_limit="1000m",
+        executor_type="sandbox",
     )
     assert executor.namespace == "test-ns"
     assert executor.image == "custom-python:latest"
     assert executor.timeout_seconds == 60
     assert executor.cpu_limit == "1000m"
+    assert executor.executor_type == "sandbox"
+    assert executor.sandbox_template == "python-sandbox-template"
+
+  def test_init_backward_compatibility(self):
+    """Tests that the executor can be initialized with positional arguments."""
+    executor = GkeCodeExecutor(
+        "/path/to/kubeconfig",
+        "test-context",
+        namespace="test-ns",
+        image="test-image",
+        timeout_seconds=100,
+        executor_type="job",
+        cpu_requested="100m",
+        mem_requested="128Mi",
+        cpu_limit="200m",
+        mem_limit="256Mi",
+    )
+    assert executor.namespace == "test-ns"
+    assert executor.image == "test-image"
+    assert executor.timeout_seconds == 100
+    assert executor.executor_type == "job"
+    assert executor.cpu_requested == "100m"
+    assert executor.mem_requested == "128Mi"
+    assert executor.cpu_limit == "200m"
+    assert executor.mem_limit == "256Mi"
+    assert executor.kubeconfig_path == "/path/to/kubeconfig"
+    assert executor.kubeconfig_context == "test-context"
+
+  def test_init_partial_positional_args(self):
+    """Tests initialization with partial positional arguments."""
+    executor = GkeCodeExecutor("/path/to/kubeconfig")
+    assert executor.kubeconfig_path == "/path/to/kubeconfig"
+    assert executor.kubeconfig_context is None
+
+  def test_init_mixed_args(self):
+    """Tests initialization with mixed positional and keyword arguments."""
+    executor = GkeCodeExecutor(
+        "/path/to/kubeconfig",
+        kubeconfig_context="test-context",
+        namespace="test-ns",
+    )
+    assert executor.kubeconfig_path == "/path/to/kubeconfig"
+
+  def test_init_sandbox_missing_dependency(self):
+    """Tests that init raises ImportError if k8s-agent-sandbox is missing."""
+    with patch(
+        "google.adk.code_executors.gke_code_executor.SandboxClient", None
+    ):
+      with pytest.raises(ImportError, match="k8s-agent-sandbox not found"):
+        GkeCodeExecutor(executor_type="sandbox")
+
+        GkeCodeExecutor(executor_type="sandbox")
 
   @patch("google.adk.code_executors.gke_code_executor.Watch")
   def test_execute_code_success(
@@ -100,8 +176,7 @@ class TestGkeCodeExecutor:
     mock_watch.return_value.stream.return_value = [{"object": mock_job}]
 
     mock_pod_list = MagicMock()
-    mock_pod_list.items = [MagicMock()]
-    mock_pod_list.items[0].metadata.name = "test-pod-name"
+    mock_pod_list.items = [mock_pod(exit_code=0)]
     mock_k8s_clients["core_v1"].list_namespaced_pod.return_value = mock_pod_list
     mock_k8s_clients["core_v1"].read_namespaced_pod_log.return_value = (
         "hello world"
@@ -115,6 +190,7 @@ class TestGkeCodeExecutor:
     # Assert
     assert result.stdout == "hello world"
     assert result.stderr == ""
+    assert result.exit_code == 0
     mock_k8s_clients[
         "core_v1"
     ].create_namespaced_config_map.assert_called_once()
@@ -134,6 +210,9 @@ class TestGkeCodeExecutor:
     mock_job.status.succeeded = None
     mock_job.status.failed = True
     mock_watch.return_value.stream.return_value = [{"object": mock_job}]
+    mock_pod_list = MagicMock()
+    mock_pod_list.items = [mock_pod(exit_code=2)]
+    mock_k8s_clients["core_v1"].list_namespaced_pod.return_value = mock_pod_list
     mock_k8s_clients["core_v1"].read_namespaced_pod_log.return_value = (
         "Traceback...\nValueError: failure"
     )
@@ -146,6 +225,33 @@ class TestGkeCodeExecutor:
     assert result.stdout == ""
     assert "Job failed. Logs:" in result.stderr
     assert "ValueError: failure" in result.stderr
+    assert result.exit_code == 2
+
+  @patch("google.adk.code_executors.gke_code_executor.Watch")
+  def test_execute_code_job_failed_without_terminated_container(
+      self,
+      mock_watch,
+      mock_k8s_clients,
+      mock_invocation_context,
+  ):
+    """Tests the fallback when the pod reports no terminated container."""
+    mock_job = MagicMock()
+    mock_job.status.succeeded = None
+    mock_job.status.failed = True
+    mock_watch.return_value.stream.return_value = [{"object": mock_job}]
+    mock_pod_list = MagicMock()
+    mock_pod_list.items = [mock_pod(exit_code=None)]
+    mock_k8s_clients["core_v1"].list_namespaced_pod.return_value = mock_pod_list
+    mock_k8s_clients["core_v1"].read_namespaced_pod_log.return_value = "gone"
+
+    executor = GkeCodeExecutor()
+    result = executor.execute_code(
+        mock_invocation_context, CodeExecutionInput(code="fail")
+    )
+
+    # Nothing reported a status, so the code is narrowed to what the Job's
+    # outcome implies.
+    assert result.exit_code == 1
 
   def test_execute_code_api_exception(
       self, mock_k8s_clients, mock_invocation_context
@@ -161,6 +267,8 @@ class TestGkeCodeExecutor:
 
     assert result.stdout == ""
     assert "Kubernetes API error: Test API Error" in result.stderr
+    # The executor failed before the code ran, so there is no status to report.
+    assert result.exit_code is None
 
   @patch("google.adk.code_executors.gke_code_executor.Watch")
   def test_execute_code_timeout(
@@ -205,6 +313,7 @@ class TestGkeCodeExecutor:
     # Check pod template properties
     pod_spec = job.spec.template.spec
     assert pod_spec.restart_policy == "Never"
+    assert pod_spec.automount_service_account_token is False
     assert pod_spec.runtime_class_name == "gvisor"
     assert len(pod_spec.tolerations) == 1
     assert pod_spec.tolerations[0].value == "gvisor"
@@ -225,3 +334,170 @@ class TestGkeCodeExecutor:
     assert sec_context.allow_privilege_escalation is False
     assert sec_context.read_only_root_filesystem is True
     assert sec_context.capabilities.drop == ["ALL"]
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_execute_code_forks_to_sandbox(
+      self,
+      mock_sandbox_client,
+      mock_invocation_context,
+      mock_k8s_clients,
+  ):
+    """Tests execute_code with executor_type='sandbox'.
+
+    Verifies that execute_code uses SandboxClient when executor_type is set to
+    'sandbox'.
+    """
+    # Setup Sandbox mock
+    mock_sandbox_instance = (
+        mock_sandbox_client.return_value.__enter__.return_value
+    )
+    mock_run_result = MagicMock()
+    mock_run_result.stdout = "sandbox stdout"
+    mock_run_result.stderr = None
+    mock_sandbox_instance.run.return_value = mock_run_result
+
+    # Instantiate with sandbox type
+    executor = GkeCodeExecutor(executor_type="sandbox")
+    code_input = CodeExecutionInput(code='print("sandbox")')
+
+    # Execute
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    # Assertions
+    assert result.stdout == "sandbox stdout"
+
+    # Verify SandboxClient was used
+    mock_sandbox_client.assert_called_once()
+    mock_sandbox_instance.run.assert_called_once()
+
+    # Verify Job path was NOT taken
+    mock_k8s_clients["batch_v1"].create_namespaced_job.assert_not_called()
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_execute_code_sandbox_connection_error(
+      self,
+      mock_sandbox_client,
+      mock_invocation_context,
+  ):
+    """Tests handling of exceptions from SandboxClient."""
+    # Setup Sandbox mock to raise exception
+    mock_sandbox_client.return_value.__enter__.side_effect = Exception(
+        "Connection failed"
+    )
+
+    # Instantiate with sandbox type
+    executor = GkeCodeExecutor(executor_type="sandbox")
+    code_input = CodeExecutionInput(code='print("sandbox")')
+
+    # Execute & Assert
+    with pytest.raises(Exception, match="Connection failed"):
+      executor.execute_code(mock_invocation_context, code_input)
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_execute_code_sandbox_runtime_error(
+      self,
+      mock_sandbox_client,
+      mock_invocation_context,
+  ):
+    """Tests handling of RuntimeError from SandboxClient."""
+    mock_sandbox_client.return_value.__enter__.side_effect = RuntimeError(
+        "Gateway not found"
+    )
+
+    executor = GkeCodeExecutor(executor_type="sandbox")
+    code_input = CodeExecutionInput(code='print("sandbox")')
+
+    with pytest.raises(
+        RuntimeError, match="Sandbox infrastructure error: Gateway not found"
+    ):
+      executor.execute_code(mock_invocation_context, code_input)
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_execute_code_sandbox_timeout_error(
+      self,
+      mock_sandbox_client,
+      mock_invocation_context,
+  ):
+    """Tests handling of TimeoutError from SandboxClient."""
+    mock_sandbox_client.return_value.__enter__.side_effect = TimeoutError(
+        "Execution timed out"
+    )
+
+    executor = GkeCodeExecutor(executor_type="sandbox")
+    code_input = CodeExecutionInput(code='print("sandbox")')
+
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    assert result.stdout == ""
+    assert "Sandbox timed out: Execution timed out" in result.stderr
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  @patch("google.adk.code_executors.gke_code_executor.Watch")
+  def test_execute_code_forks_to_job(
+      self,
+      mock_watch,
+      mock_sandbox_client,
+      mock_invocation_context,
+      mock_k8s_clients,
+  ):
+    """Tests that execute_code uses K8s Job when executor_type='job'."""
+    # Setup K8s Job mocks (success path)
+    mock_job = MagicMock()
+    mock_job.status.succeeded = True
+    mock_watch.return_value.stream.return_value = [{"object": mock_job}]
+
+    mock_k8s_clients["core_v1"].list_namespaced_pod.return_value.items = [
+        mock_pod(name="pod-1", exit_code=None)
+    ]
+    mock_k8s_clients["core_v1"].read_namespaced_pod_log.return_value = (
+        "job stdout"
+    )
+
+    # Instantiate with job type
+    executor = GkeCodeExecutor(executor_type="job")
+    code_input = CodeExecutionInput(code='print("job")')
+
+    # Execute
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    # Assertions
+    assert result.stdout == "job stdout"
+    # No terminated container to read, so the succeeding Job implies 0.
+    assert result.exit_code == 0
+
+    # Verify Job path WAS taken
+    mock_k8s_clients["batch_v1"].create_namespaced_job.assert_called_once()
+
+    # Verify SandboxClient was NOT used
+    mock_sandbox_client.assert_not_called()
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_execute_in_sandbox_returns_stderr(
+      self,
+      mock_sandbox_client,
+      mock_invocation_context,
+  ):
+    """Tests that stderr from the sandbox run is propagated to the result."""
+    # Setup Sandbox mock
+    mock_sandbox_instance = (
+        mock_sandbox_client.return_value.__enter__.return_value
+    )
+    mock_run_result = MagicMock()
+    mock_run_result.stdout = ""
+    mock_run_result.stderr = "oops\n"
+    mock_sandbox_instance.run.return_value = mock_run_result
+
+    # Instantiate with sandbox type
+    executor = GkeCodeExecutor(executor_type="sandbox")
+    code_input = CodeExecutionInput(
+        code="import sys; print('oops', file=sys.stderr)"
+    )
+
+    # Execute
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    # Assertions
+    assert result.stdout == ""
+    assert result.stderr == "oops\n"
+    mock_sandbox_instance.write.assert_called_with("script.py", code_input.code)
+    mock_sandbox_instance.run.assert_called_with("python3 script.py")

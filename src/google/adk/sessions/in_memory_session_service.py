@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import copy
 import logging
-import time
 from typing import Any
 from typing import Optional
-import uuid
 
+from google.adk.platform import time as platform_time
+from google.adk.platform import uuid as platform_uuid
 from typing_extensions import override
 
 from . import _session_util
 from ..errors.already_exists_error import AlreadyExistsError
+from ..errors.session_not_found_error import SessionNotFoundError
 from ..events.event import Event
+from ..features import FeatureName
+from ..features import is_feature_enabled
 from .base_session_service import BaseSessionService
 from .base_session_service import GetSessionConfig
 from .base_session_service import ListSessionsResponse
@@ -34,6 +37,28 @@ from .state import State
 logger = logging.getLogger('google_adk.' + __name__)
 
 
+def _light_copy(session: Session) -> Session:
+  """Returns a light copy of the session.
+
+  Main difference between this and true shallow-copy is that container fields
+  (e.g., events and state) are also shallow-copied. What this means is appending
+  to events/state of the copied session won't affect the original while avoiding
+  the potentially expensive cost of a full/recursive deep-copy of all events and
+  state.
+  """
+  copied_session = session.model_copy(deep=False)
+  copied_session.events = copy.copy(session.events)
+  copied_session.state = copy.copy(session.state)
+  return copied_session
+
+
+def _copy_session(session: Session) -> Session:
+  if is_feature_enabled(FeatureName.IN_MEMORY_SESSION_SERVICE_LIGHT_COPY):
+    return _light_copy(session)
+  else:
+    return copy.deepcopy(session)
+
+
 class InMemorySessionService(BaseSessionService):
   """An in-memory implementation of the session service.
 
@@ -41,7 +66,7 @@ class InMemorySessionService(BaseSessionService):
   testing and development only.
   """
 
-  def __init__(self):
+  def __init__(self) -> None:
     # A map from app name to a map from user ID to a map from session ID to
     # session.
     self.sessions: dict[str, dict[str, dict[str, Session]]] = {}
@@ -90,11 +115,12 @@ class InMemorySessionService(BaseSessionService):
       state: Optional[dict[str, Any]] = None,
       session_id: Optional[str] = None,
   ) -> Session:
+    session_id = session_id.strip() if session_id else None
     if session_id and self._get_session_impl(
         app_name=app_name, user_id=user_id, session_id=session_id
     ):
       raise AlreadyExistsError(f'Session with id {session_id} already exists.')
-    state_deltas = _session_util.extract_state_delta(state)
+    state_deltas = _session_util.extract_state_delta(state or {})
     app_state_delta = state_deltas['app']
     user_state_delta = state_deltas['user']
     session_state = state_deltas['session']
@@ -105,17 +131,13 @@ class InMemorySessionService(BaseSessionService):
           user_state_delta
       )
 
-    session_id = (
-        session_id.strip()
-        if session_id and session_id.strip()
-        else str(uuid.uuid4())
-    )
+    session_id = session_id or platform_uuid.new_uuid()
     session = Session(
         app_name=app_name,
         user_id=user_id,
         id=session_id,
         state=session_state or {},
-        last_update_time=time.time(),
+        last_update_time=platform_time.get_time(),
     )
 
     if app_name not in self.sessions:
@@ -124,7 +146,7 @@ class InMemorySessionService(BaseSessionService):
       self.sessions[app_name][user_id] = {}
     self.sessions[app_name][user_id][session_id] = session
 
-    copied_session = copy.deepcopy(session)
+    copied_session = _copy_session(session)
     return self._merge_state(app_name, user_id, copied_session)
 
   @override
@@ -174,14 +196,17 @@ class InMemorySessionService(BaseSessionService):
     if session_id not in self.sessions[app_name][user_id]:
       return None
 
-    session = self.sessions[app_name][user_id].get(session_id)
-    copied_session = copy.deepcopy(session)
+    session = self.sessions[app_name][user_id][session_id]
+    copied_session = _copy_session(session)
 
     if config:
-      if config.num_recent_events:
-        copied_session.events = copied_session.events[
-            -config.num_recent_events :
-        ]
+      if config.num_recent_events is not None:
+        if config.num_recent_events == 0:
+          copied_session.events = []
+        else:
+          copied_session.events = copied_session.events[
+              -config.num_recent_events :
+          ]
       if config.after_timestamp:
         i = len(copied_session.events) - 1
         while i >= 0:
@@ -242,19 +267,22 @@ class InMemorySessionService(BaseSessionService):
     sessions_without_events = []
 
     if user_id is None:
-      for user_id in self.sessions[app_name]:
-        for session_id in self.sessions[app_name][user_id]:
-          session = self.sessions[app_name][user_id][session_id]
-          copied_session = copy.deepcopy(session)
+      for uid in list(self.sessions[app_name].keys()):
+        for session in list(self.sessions[app_name][uid].values()):
+          copied_session = _copy_session(session)
           copied_session.events = []
-          copied_session = self._merge_state(app_name, user_id, copied_session)
+          copied_session = self._merge_state(app_name, uid, copied_session)
           sessions_without_events.append(copied_session)
     else:
-      for session in self.sessions[app_name][user_id].values():
-        copied_session = copy.deepcopy(session)
+      for session in list(self.sessions[app_name][user_id].values()):
+        copied_session = _copy_session(session)
         copied_session.events = []
         copied_session = self._merge_state(app_name, user_id, copied_session)
         sessions_without_events.append(copied_session)
+
+    sessions_without_events.sort(
+        key=lambda s: (s.last_update_time, s.user_id, s.id)
+    )
     return ListSessionsResponse(sessions=sessions_without_events)
 
   @override
@@ -287,6 +315,17 @@ class InMemorySessionService(BaseSessionService):
     self.sessions[app_name][user_id].pop(session_id)
 
   @override
+  async def get_user_state(
+      self, *, app_name: str, user_id: str
+  ) -> dict[str, Any]:
+    user_state = self.user_state.get(app_name, {}).get(user_id, {})
+    # Copy as deeply as _copy_session copies a session's own state, so user
+    # state is no more reachable through the result than session state is.
+    if is_feature_enabled(FeatureName.IN_MEMORY_SESSION_SERVICE_LIGHT_COPY):
+      return dict(user_state)
+    return copy.deepcopy(user_state)
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event
@@ -295,29 +334,30 @@ class InMemorySessionService(BaseSessionService):
     user_id = session.user_id
     session_id = session.id
 
-    def _warning(message: str) -> None:
-      logger.warning(
-          f'Failed to append event to session {session_id}: {message}'
-      )
+    if session_id not in self.sessions.get(app_name, {}).get(user_id, {}):
+      raise SessionNotFoundError(f'Session {session_id} not found.')
 
-    if app_name not in self.sessions:
-      _warning(f'app_name {app_name} not in sessions')
-      return event
-    if user_id not in self.sessions[app_name]:
-      _warning(f'user_id {user_id} not in sessions[app_name]')
-      return event
-    if session_id not in self.sessions[app_name][user_id]:
-      _warning(f'session_id {session_id} not in sessions[app_name][user_id]')
+    # Fetch the canonical storage session early so we can drop a re-delivered
+    # event before modifying any state. The same event can be delivered more
+    # than once when the orchestrator broadcasts a shared-state delta to
+    # several concurrent session references; deduplicating here prevents
+    # double-application of state updates and duplicate entries in event lists.
+    # A re-delivery is an equal event -- the same object, or a copy carrying
+    # the same id and fields -- so dedupe on equality, gated on a matching id
+    # for speed. Distinct events that merely share an id (e.g. tests that
+    # stamp a fixed uuid) are not equal and are kept.
+    storage_session = self.sessions[app_name][user_id][session_id]
+    if any(e == event for e in storage_session.events if e.id == event.id):
       return event
 
     # Update the in-memory session.
     await super().append_event(session=session, event=event)
     session.last_update_time = event.timestamp
 
-    # Update the storage session
-    storage_session = self.sessions[app_name][user_id].get(session_id)
-    storage_session.events.append(event)
-    storage_session.last_update_time = event.timestamp
+    # Update the storage session if the caller holds a stale copy.
+    if storage_session is not session:
+      storage_session.events.append(event)
+      storage_session.last_update_time = event.timestamp
 
     if event.actions and event.actions.state_delta:
       state_deltas = _session_util.extract_state_delta(

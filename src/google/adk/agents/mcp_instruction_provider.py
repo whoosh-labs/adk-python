@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,32 +16,18 @@
 
 from __future__ import annotations
 
-import logging
 import sys
 from typing import Any
 from typing import Dict
 from typing import TextIO
 
+from ..dependencies._mcp import types
+from ..tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from .llm_agent import InstructionProvider
 from .readonly_context import ReadonlyContext
 
-# Attempt to import MCP Session Manager from the MCP library, and hints user to
-# upgrade their Python version to 3.10 if it fails.
-try:
-  from mcp import types
 
-  from ..tools.mcp_tool.mcp_session_manager import MCPSessionManager
-except ImportError as e:
-  if sys.version_info < (3, 10):
-    raise ImportError(
-        "MCP Session Manager requires Python 3.10 or above. Please upgrade"
-        " your Python version."
-    ) from e
-  else:
-    raise e
-
-
-class McpInstructionProvider(InstructionProvider):
+class McpInstructionProvider(InstructionProvider):  # type: ignore[misc]
   """Fetches agent instructions from an MCP server."""
 
   def __init__(
@@ -58,7 +44,7 @@ class McpInstructionProvider(InstructionProvider):
         errlog: TextIO stream for error logging.
     """
     self._connection_params = connection_params
-    self._errlog = errlog or logging.getLogger(__name__)
+    self._errlog = errlog
     self._mcp_session_manager = MCPSessionManager(
         connection_params=self._connection_params,
         errlog=self._errlog,
@@ -75,25 +61,31 @@ class McpInstructionProvider(InstructionProvider):
         The instruction string.
     """
     session = await self._mcp_session_manager.create_session()
-    # Fetch prompt definition to get the required argument names
-    prompt_definitions = await session.list_prompts()
-    prompt_definition = next(
-        (p for p in prompt_definitions.prompts if p.name == self.prompt_name),
-        None,
-    )
+    # Hold the session out of the pool's idle sweep while it is in use, so
+    # another caller's sweep cannot close the transport mid-call.
+    self._mcp_session_manager._begin_session_use()  # pylint: disable=protected-access
+    try:
+      # Fetch prompt definition to get the required argument names
+      prompt_definitions = await session.list_prompts()
+      prompt_definition = next(
+          (p for p in prompt_definitions.prompts if p.name == self.prompt_name),
+          None,
+      )
 
-    # Fetch arguments from context state if the prompt requires them
-    prompt_args: Dict[str, Any] = {}
-    if prompt_definition and prompt_definition.arguments:
-      arg_names = {arg.name for arg in prompt_definition.arguments}
-      prompt_args = {
-          k: v for k, v in (context.state or {}).items() if k in arg_names
-      }
+      # Fetch arguments from context state if the prompt requires them
+      prompt_args: Dict[str, Any] = {}
+      if prompt_definition and prompt_definition.arguments:
+        arg_names = {arg.name for arg in prompt_definition.arguments}
+        prompt_args = {
+            k: v for k, v in (context.state or {}).items() if k in arg_names
+        }
 
-    # Fetch the specific prompt by name with arguments from context state
-    prompt_result: types.GetPromptResult = await session.get_prompt(
-        self.prompt_name, arguments=prompt_args
-    )
+      # Fetch the specific prompt by name with arguments from context state
+      prompt_result: types.GetPromptResult = await session.get_prompt(
+          self.prompt_name, arguments=prompt_args
+      )
+    finally:
+      self._mcp_session_manager._end_session_use()  # pylint: disable=protected-access
 
     if prompt_result and prompt_result.messages:
       # Concatenate content of all messages to form the instruction.

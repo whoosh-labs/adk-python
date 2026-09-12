@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -296,24 +296,31 @@ def test_clone_preserves_agent_type():
   assert isinstance(llm_cloned, LlmAgent)
 
   # Test SequentialAgent
-  seq_original = SequentialAgent(name="seq_test")
+  seq_original = SequentialAgent(
+      name="seq_test", sub_agents=[LlmAgent(name="dummy_seq")]
+  )
   seq_cloned = seq_original.clone()
   assert isinstance(seq_cloned, SequentialAgent)
 
   # Test ParallelAgent
-  par_original = ParallelAgent(name="par_test")
+  par_original = ParallelAgent(
+      name="par_test", sub_agents=[LlmAgent(name="dummy_par")]
+  )
   par_cloned = par_original.clone()
   assert isinstance(par_cloned, ParallelAgent)
 
   # Test LoopAgent
-  loop_original = LoopAgent(name="loop_test")
+  loop_original = LoopAgent(
+      name="loop_test", sub_agents=[LlmAgent(name="dummy_loop")]
+  )
   loop_cloned = loop_original.clone()
   assert isinstance(loop_cloned, LoopAgent)
 
 
 def test_clone_with_agent_specific_fields():
   # Test LoopAgent
-  loop_original = LoopAgent(name="loop_test")
+  dummy = LlmAgent(name="dummy")
+  loop_original = LoopAgent(name="loop_test", sub_agents=[dummy])
   loop_cloned = loop_original.clone({"max_iterations": 10})
   assert isinstance(loop_cloned, LoopAgent)
   assert loop_cloned.max_iterations == 10
@@ -559,6 +566,69 @@ def test_clone_shallow_copies_lists_with_sub_agents():
   _check_lists_contain_same_contents(
       tools, original_sub_agent.tools, cloned_sub_agent.tools
   )
+
+
+def test_clone_rebinds_callbacks_bound_to_the_original_agent():
+  """A callback that is one of the agent's own methods follows the clone."""
+  ran_for: list[str] = []
+
+  class _Agent(LlmAgent):
+
+    def __init__(self, **kwargs: Any):
+      super().__init__(**kwargs)
+      self.before_agent_callback = self._record
+
+    def _record(self, callback_context: Any) -> None:
+      ran_for.append(self.name)
+
+  original = _Agent(name="agent")
+  cloned = original.clone(update={"name": "cloned"})
+
+  cloned.before_agent_callback(None)
+
+  assert ran_for == ["cloned"]
+
+
+def test_clone_rebinds_callbacks_bound_to_the_original_agent_in_a_list():
+  """Every one of the agent's own methods in a list field follows the clone."""
+  ran_for: list[str] = []
+
+  class _Agent(LlmAgent):
+
+    def __init__(self, **kwargs: Any):
+      super().__init__(**kwargs)
+      self.before_agent_callback = [self._record]
+
+    def _record(self, callback_context: Any) -> None:
+      ran_for.append(self.name)
+
+  original = _Agent(name="agent")
+  cloned = original.clone(update={"name": "cloned"})
+
+  cloned.before_agent_callback[0](None)
+
+  assert ran_for == ["cloned"]
+
+
+def test_clone_keeps_callbacks_bound_to_another_object():
+  """A callback bound to something other than the agent is left alone."""
+
+  class _Recorder:
+
+    def __init__(self) -> None:
+      self.contexts: list[Any] = []
+
+    def before(self, callback_context: Any) -> None:
+      self.contexts.append(callback_context)
+
+  recorder = _Recorder()
+  original = LlmAgent(name="agent", before_agent_callback=recorder.before)
+  cloned = original.clone()
+
+  cloned.before_agent_callback(None)
+
+  assert cloned.before_agent_callback.__self__ is recorder
+  assert len(recorder.contexts) == 1
 
 
 if __name__ == "__main__":

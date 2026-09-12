@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,41 +16,65 @@ from __future__ import annotations
 
 from abc import ABC
 import asyncio
-import datetime
+import contextlib
 import inspect
 import logging
 from typing import AsyncGenerator
 from typing import cast
+from typing import Iterator
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from google.adk.platform import time as platform_time
 from google.genai import types
-from websockets.exceptions import ConnectionClosed
-from websockets.exceptions import ConnectionClosedOK
+from opentelemetry import context as otel_context
+from opentelemetry import trace
 
+from . import _live_llm_flow
 from . import _output_schema_processor
 from . import functions
+from ...agents._streaming_mode import StreamingMode
 from ...agents.base_agent import BaseAgent
 from ...agents.callback_context import CallbackContext
 from ...agents.invocation_context import InvocationContext
-from ...agents.live_request_queue import LiveRequestQueue
 from ...agents.readonly_context import ReadonlyContext
-from ...agents.run_config import StreamingMode
-from ...agents.transcription_entry import TranscriptionEntry
+from ...auth.auth_tool import AuthConfig
 from ...events.event import Event
-from ...features import FeatureName
-from ...features import is_feature_enabled
+from ...live._audio_cache_manager import AudioCacheManager
+from ...live.live_request_queue import LiveRequestQueue
 from ...models.base_llm_connection import BaseLlmConnection
 from ...models.llm_request import LlmRequest
 from ...models.llm_response import LlmResponse
 from ...telemetry.tracing import trace_call_llm
-from ...telemetry.tracing import trace_send_data
 from ...telemetry.tracing import tracer
 from ...tools.base_toolset import BaseToolset
-from ...tools.google_search_tool import google_search
 from ...tools.tool_context import ToolContext
 from ...utils.context_utils import Aclosing
-from .audio_cache_manager import AudioCacheManager
+from ._invocation_utils import as_llm_agent as _as_llm_agent
+from ._invocation_utils import copy_http_options
+from ._invocation_utils import require_agent as _require_agent
+from ._invocation_utils import require_run_config as _require_run_config
+from ._model_response_finalizer import finalize_model_response_event
+from ._model_response_finalizer import handle_after_model_callback
+from ._model_response_finalizer import handle_before_model_callback
+from ._model_response_finalizer import run_and_handle_error
+from ._resume_utils import decide_step_resume
+from ._resume_utils import ResumeAction
+from .functions import build_auth_request_event
+
+# Prefix used by toolset auth credential IDs
+TOOLSET_AUTH_CREDENTIAL_ID_PREFIX = '_adk_toolset_auth_'
+
+# Backwards compatibility aliases for external callers (e.g. Orcas call_llm_node)
+_finalize_model_response_event = finalize_model_response_event
+_handle_before_model_callback = handle_before_model_callback
+_handle_after_model_callback = handle_after_model_callback
+_run_and_handle_error = run_and_handle_error
+
+
+_ReconnectMode = _live_llm_flow._ReconnectMode
+_ReconnectSentinel = _live_llm_flow._ReconnectSentinel
+
 
 if TYPE_CHECKING:
   from ...agents.llm_agent import LlmAgent
@@ -62,22 +86,241 @@ logger = logging.getLogger('google_adk.' + __name__)
 
 _ADK_AGENT_NAME_LABEL_KEY = 'adk_agent_name'
 
+_NO_CONTENT_ERROR_CODE = 'MODEL_RETURNED_NO_CONTENT'
+_NO_CONTENT_ERROR_MESSAGE = (
+    'The model returned no content (finish_reason=STOP with empty parts).'
+)
+
 # Timing configuration
-DEFAULT_REQUEST_QUEUE_TIMEOUT = 0.25
 DEFAULT_TRANSFER_AGENT_DELAY = 1.0
 DEFAULT_TASK_COMPLETION_DELAY = 1.0
 
+# How long a live run waits for a background tool task to honor cancellation
+# before giving up on it. Matches the budget `stop_streaming` already gives a
+# streaming tool it cancels.
+_TOOL_SHUTDOWN_TIMEOUT_SECONDS = 1.0
+
+DEFAULT_MAX_RECONNECT_ATTEMPTS = 5
+
 # Statistics configuration
 DEFAULT_ENABLE_CACHE_STATISTICS = False
+
+_require_live_request_queue = _live_llm_flow.require_live_request_queue
+
+
+async def _resolve_toolset_auth(
+    invocation_context: InvocationContext,
+    agent: LlmAgent,
+) -> AsyncGenerator[Event, None]:
+  """Resolves authentication for toolsets before tool listing.
+
+  For each toolset with auth configured via get_auth_config():
+  - If credential is available, populate auth_config.exchanged_auth_credential
+  - If credential is not available, yield auth request event and interrupt
+
+  Args:
+    invocation_context: The invocation context.
+    agent: The LLM agent.
+
+  Yields:
+    Auth request events if any toolset needs authentication.
+  """
+  if not agent.tools:
+    return
+
+  pending_auth_requests: dict[str, AuthConfig] = {}
+  callback_context = CallbackContext(invocation_context)
+
+  for tool_union in agent.tools:
+    if not isinstance(tool_union, BaseToolset):
+      continue
+
+    auth_config = tool_union.get_auth_config()
+    if not auth_config:
+      continue
+
+    auth_config_copy = auth_config.model_copy(deep=True)
+    from ...auth.credential_manager import CredentialManager
+
+    try:
+      credential = await CredentialManager(
+          auth_config_copy
+      ).get_auth_credential(callback_context)
+    except ValueError as e:
+      # Validation errors from CredentialManager should be logged but not
+      # block the flow - the toolset may still work without auth
+      logger.warning(
+          'Failed to get auth credential for toolset %s: %s',
+          type(tool_union).__name__,
+          e,
+      )
+      credential = None
+
+    if credential:
+      # Store in invocation context to avoid data leakage and race conditions
+      credential_key = auth_config.credential_key
+      if credential_key is None:
+        raise RuntimeError('Resolved toolset auth is missing a credential key.')
+      invocation_context.credential_by_key[credential_key] = credential
+    else:
+      # Need auth - will interrupt
+      toolset_id = (
+          f'{TOOLSET_AUTH_CREDENTIAL_ID_PREFIX}{type(tool_union).__name__}'
+      )
+      pending_auth_requests[toolset_id] = auth_config_copy
+
+  if not pending_auth_requests:
+    return
+
+  from ...auth.auth_handler import AuthHandler
+
+  auth_requests = {
+      credential_id: AuthHandler(auth_config).generate_auth_request()
+      for credential_id, auth_config in pending_auth_requests.items()
+  }
+
+  # Yield event with auth requests using the shared helper
+  yield build_auth_request_event(
+      invocation_context,
+      auth_requests,
+      author=agent.name,
+  )
+
+  # Interrupt invocation
+  invocation_context.end_invocation = True
+
+
+@contextlib.contextmanager
+def _use_otel_context(context: otel_context.Context) -> Iterator[None]:
+  """Makes ``context`` the current OpenTelemetry context inside the block."""
+  token = otel_context.attach(context)
+  try:
+    yield
+  finally:
+    otel_context.detach(token)
+
+
+async def _process_agent_tools(
+    invocation_context: InvocationContext,
+    llm_request: LlmRequest,
+) -> None:
+  """Process the agent's tools and populate ``llm_request.tools_dict``.
+
+  Iterates over the agent's ``tools`` list, converts each tool union
+  (callable, BaseTool, or BaseToolset) into resolved ``BaseTool``
+  instances, and calls ``process_llm_request`` on each to register
+  tool declarations in the request.
+
+  Tool-union resolution is dispatched concurrently via ``asyncio.gather``
+  to overlap I/O-bound listings (e.g. MCP ``list_tools`` over the
+  network). The subsequent ``process_llm_request`` calls are kept
+  serial in the original ``agent.tools`` order: some tools read/write
+  ``llm_request`` state (e.g. ``GoogleSearchTool`` writes
+  ``llm_request.model``; ``ComputerUseToolset`` performs an idempotency
+  check on ``llm_request.config.tools``) and rely on observing the
+  post-state of earlier tools.
+
+  After this function returns, ``llm_request.tools_dict`` maps tool
+  names to ``BaseTool`` instances ready for function call dispatch.
+
+  Args:
+    invocation_context: The invocation context (``agent`` is read from
+      ``invocation_context.agent``).
+    llm_request: The LLM request to populate with tool declarations.
+  """
+  raw_agent = invocation_context.agent
+  if (
+      raw_agent is None
+      or not hasattr(raw_agent, 'tools')
+      or not raw_agent.tools
+  ):
+    invocation_context.canonical_tools_cache = []
+    return
+  agent = cast('LlmAgent', raw_agent)
+
+  from .agent_transfer import _get_transfer_targets
+
+  multiple_tools = len(agent.tools) > 1 or bool(_get_transfer_targets(agent))
+  model = agent.canonical_model
+
+  from ...agents.llm_agent import _convert_tool_union_to_tools
+
+  # Resolve tool_unions in parallel. ``asyncio.gather`` preserves
+  # input order in the returned list, so the serial commit phase below
+  # still observes ``agent.tools`` order. If any resolution raises,
+  # gather cancels the siblings and propagates -- same observable
+  # behavior as the previous serial loop, which would propagate the
+  # first exception and abandon the rest.
+  resolved_tools_per_union = await asyncio.gather(*(
+      _convert_tool_union_to_tools(
+          tool_union,
+          ReadonlyContext(invocation_context),
+          model,
+          multiple_tools,
+      )
+      for tool_union in agent.tools
+  ))
+
+  # Serial commit phase, in original ``agent.tools`` order. Mutations
+  # to ``llm_request`` and reads of its state (model, config.tools,
+  # tools_dict) preserve today's ordering semantics exactly.
+  for tool_union, tools in zip(agent.tools, resolved_tools_per_union):
+    tool_context = ToolContext(invocation_context)
+
+    # If it's a toolset, process it first
+    if isinstance(tool_union, BaseToolset):
+      await tool_union.process_llm_request(
+          tool_context=tool_context, llm_request=llm_request
+      )
+
+    # Then process all tools from this tool union
+    for tool in tools:
+      await tool.process_llm_request(
+          tool_context=tool_context, llm_request=llm_request
+      )
+
+  if invocation_context.live_request_queue is not None:
+    _mark_live_async_tools_non_blocking(llm_request)
+
+  # Reuse this exact, current-step resolution in after-model processing. Tool
+  # sets can change between model steps, so the cache is refreshed each time.
+  invocation_context.canonical_tools_cache = [
+      tool for tools in resolved_tools_per_union for tool in tools
+  ]
+
+
+def _mark_live_async_tools_non_blocking(llm_request: LlmRequest) -> None:
+  """Marks live streaming and response-scheduling tools as NON_BLOCKING.
+
+  These tools emit asynchronous FunctionResponses, which the Live API only
+  accepts for NON_BLOCKING declarations.
+  """
+  if not llm_request.config.tools:
+    return
+  for gemini_tool in llm_request.config.tools:
+    if not isinstance(gemini_tool, types.Tool):
+      continue
+    for declaration in gemini_tool.function_declarations or []:
+      declaration_name = declaration.name
+      if declaration_name is None:
+        continue
+      tool = llm_request.tools_dict.get(declaration_name)
+      if tool is None:
+        continue
+      is_streaming_tool = hasattr(tool, 'func') and inspect.isasyncgenfunction(
+          tool.func
+      )
+      if tool.response_scheduling is not None or is_streaming_tool:
+        declaration.behavior = types.Behavior.NON_BLOCKING
 
 
 class BaseLlmFlow(ABC):
   """A basic flow that calls the LLM in a loop until a final response is generated.
 
-  This flow ends when it transfer to another agent.
+  This flow ends when it transfers to another agent.
   """
 
-  def __init__(self):
+  def __init__(self) -> None:
     self.request_processors: list[BaseLlmRequestProcessor] = []
     self.response_processors: list[BaseLlmResponseProcessor] = []
 
@@ -89,276 +332,73 @@ class BaseLlmFlow(ABC):
       invocation_context: InvocationContext,
   ) -> AsyncGenerator[Event, None]:
     """Runs the flow using live api."""
-    llm_request = LlmRequest()
-    event_id = Event.new_id()
-
-    # Preprocess before calling the LLM.
     async with Aclosing(
-        self._preprocess_async(invocation_context, llm_request)
+        _live_llm_flow.run_live_flow(self, invocation_context)
     ) as agen:
       async for event in agen:
         yield event
-    if invocation_context.end_invocation:
-      return
 
-    llm = self.__get_llm(invocation_context)
-    logger.debug(
-        'Establishing live connection for agent: %s with llm request: %s',
-        invocation_context.agent.name,
-        llm_request,
+  async def _stop_background_tool_tasks(
+      self, invocation_context: InvocationContext
+  ) -> None:
+    """Cancels the background tool tasks this live run started.
+
+    A live run starts two kinds of tools as bare asyncio tasks: streaming
+    tools (``active_streaming_tools``) and non-blocking tools
+    (``active_non_blocking_tool_tasks``). Nothing tied either to the lifetime
+    of the run that started it — only an explicit ``stop_streaming`` call ever
+    cancelled one — so a tool kept running after its agent was done, feeding
+    function responses into a live request queue that by then belonged to
+    another agent, or to nobody at all.
+
+    The tools stop when the run that started them ends, whether that is a
+    handoff to another agent, ``task_completed``, the connection closing, or
+    the caller walking away. Tying this to the agent run rather than to the
+    whole invocation is what keeps a tool from reaching the model of the
+    agent that comes after it.
+
+    Cancellation is best effort: a task that does not stop within
+    ``_TOOL_SHUTDOWN_TIMEOUT_SECONDS`` is logged and left behind rather than
+    stalling the handoff or the caller's teardown on it.
+    """
+    await _live_llm_flow.stop_background_tool_tasks(self, invocation_context)
+
+  async def _screen_live_user_content(
+      self,
+      invocation_context: InvocationContext,
+      content: types.Content,
+      llm_request: LlmRequest,
+  ) -> Optional[Event]:
+    """Screens live user content with a before model callback."""
+    return await _live_llm_flow.screen_live_user_content(
+        self, invocation_context, content, llm_request
     )
-
-    attempt = 1
-    while True:
-      try:
-        # On subsequent attempts, use the saved token to reconnect
-        if invocation_context.live_session_resumption_handle:
-          logger.info('Attempting to reconnect (Attempt %s)...', attempt)
-          attempt += 1
-          if not llm_request.live_connect_config:
-            llm_request.live_connect_config = types.LiveConnectConfig()
-          llm_request.live_connect_config.session_resumption.handle = (
-              invocation_context.live_session_resumption_handle
-          )
-          llm_request.live_connect_config.session_resumption.transparent = True
-
-        logger.info(
-            'Establishing live connection for agent: %s',
-            invocation_context.agent.name,
-        )
-        async with llm.connect(llm_request) as llm_connection:
-          if llm_request.contents:
-            # Sends the conversation history to the model.
-            with tracer.start_as_current_span('send_data'):
-              # Combine regular contents with audio/transcription from session
-              logger.debug('Sending history to model: %s', llm_request.contents)
-              await llm_connection.send_history(llm_request.contents)
-              trace_send_data(
-                  invocation_context, event_id, llm_request.contents
-              )
-
-          send_task = asyncio.create_task(
-              self._send_to_model(llm_connection, invocation_context)
-          )
-
-          try:
-            async with Aclosing(
-                self._receive_from_model(
-                    llm_connection,
-                    event_id,
-                    invocation_context,
-                    llm_request,
-                )
-            ) as agen:
-              async for event in agen:
-                # Empty event means the queue is closed.
-                if not event:
-                  break
-                logger.debug('Receive new event: %s', event)
-                yield event
-                # send back the function response to models
-                if event.get_function_responses():
-                  logger.debug(
-                      'Sending back last function response event: %s', event
-                  )
-                  invocation_context.live_request_queue.send_content(
-                      event.content
-                  )
-                # We handle agent transfer here in `run_live` rather than
-                # in `_postprocess_live` to prevent duplication of function
-                # response processing. If agent transfer were handled in
-                # `_postprocess_live`, events yielded from child agent's
-                # `run_live` would bubble up to parent agent's `run_live`,
-                # causing `event.get_function_responses()` to be true in both
-                # child and parent, and `send_content()` to be called twice for
-                # the same function response. By handling agent transfer here,
-                # we ensure that only child agent processes its own function
-                # responses after the transfer.
-                if (
-                    event.content
-                    and event.content.parts
-                    and event.content.parts[0].function_response
-                    and event.content.parts[0].function_response.name
-                    == 'transfer_to_agent'
-                ):
-                  await asyncio.sleep(DEFAULT_TRANSFER_AGENT_DELAY)
-                  # cancel the tasks that belongs to the closed connection.
-                  send_task.cancel()
-                  logger.debug('Closing live connection')
-                  await llm_connection.close()
-                  logger.debug('Live connection closed.')
-                  # transfer to the sub agent.
-                  transfer_to_agent = event.actions.transfer_to_agent
-                  if transfer_to_agent:
-                    logger.debug('Transferring to agent: %s', transfer_to_agent)
-                    agent_to_run = self._get_agent_to_run(
-                        invocation_context, transfer_to_agent
-                    )
-                    async with Aclosing(
-                        agent_to_run.run_live(invocation_context)
-                    ) as agen:
-                      async for item in agen:
-                        yield item
-                if (
-                    event.content
-                    and event.content.parts
-                    and event.content.parts[0].function_response
-                    and event.content.parts[0].function_response.name
-                    == 'task_completed'
-                ):
-                  # this is used for sequential agent to signal the end of the agent.
-                  await asyncio.sleep(DEFAULT_TASK_COMPLETION_DELAY)
-                  # cancel the tasks that belongs to the closed connection.
-                  send_task.cancel()
-                  return
-          finally:
-            # Clean up
-            if not send_task.done():
-              send_task.cancel()
-            try:
-              await send_task
-            except asyncio.CancelledError:
-              pass
-      except (ConnectionClosed, ConnectionClosedOK) as e:
-        # when the session timeout, it will just close and not throw exception.
-        # so this is for bad cases
-        logger.error('Connection closed: %s.', e)
-        raise
-      except Exception as e:
-        logger.error(
-            'An unexpected error occurred in live flow: %s', e, exc_info=True
-        )
-        raise
 
   async def _send_to_model(
       self,
       llm_connection: BaseLlmConnection,
       invocation_context: InvocationContext,
-  ):
+      llm_request: LlmRequest,
+  ) -> None:
     """Sends data to model."""
-    while True:
-      live_request_queue = invocation_context.live_request_queue
-      try:
-        # Streamlit's execution model doesn't preemptively yield to the event
-        # loop. Therefore, we must explicitly introduce timeouts to allow the
-        # event loop to process events.
-        # TODO: revert back(remove timeout) once we move off streamlit.
-        live_request = await asyncio.wait_for(
-            live_request_queue.get(), timeout=DEFAULT_REQUEST_QUEUE_TIMEOUT
-        )
-        # duplicate the live_request to all the active streams
-        logger.debug(
-            'Sending live request %s to active streams: %s',
-            live_request,
-            invocation_context.active_streaming_tools,
-        )
-        if invocation_context.active_streaming_tools:
-          for active_streaming_tool in (
-              invocation_context.active_streaming_tools
-          ).values():
-            if active_streaming_tool.stream:
-              active_streaming_tool.stream.send(live_request)
-        await asyncio.sleep(0)
-      except asyncio.TimeoutError:
-        continue
-      if live_request.close:
-        await llm_connection.close()
-        return
-
-      if live_request.activity_start:
-        await llm_connection.send_realtime(types.ActivityStart())
-      elif live_request.activity_end:
-        await llm_connection.send_realtime(types.ActivityEnd())
-      elif live_request.blob:
-        # Cache input audio chunks before flushing
-        self.audio_cache_manager.cache_audio(
-            invocation_context, live_request.blob, cache_type='input'
-        )
-
-        await llm_connection.send_realtime(live_request.blob)
-
-      if live_request.content:
-        await llm_connection.send_content(live_request.content)
+    await _live_llm_flow.send_to_model(
+        self, llm_connection, invocation_context, llm_request
+    )
 
   async def _receive_from_model(
       self,
       llm_connection: BaseLlmConnection,
-      event_id: str,
       invocation_context: InvocationContext,
       llm_request: LlmRequest,
   ) -> AsyncGenerator[Event, None]:
     """Receive data from model and process events using BaseLlmConnection."""
-
-    def get_author_for_event(llm_response):
-      """Get the author of the event.
-
-      When the model returns transcription, the author is "user". Otherwise, the
-      author is the agent name(not 'model').
-
-      Args:
-        llm_response: The LLM response from the LLM call.
-      """
-      if (
-          llm_response
-          and llm_response.content
-          and llm_response.content.role == 'user'
-      ):
-        return 'user'
-      else:
-        return invocation_context.agent.name
-
-    assert invocation_context.live_request_queue
-    try:
-      while True:
-        async with Aclosing(llm_connection.receive()) as agen:
-          async for llm_response in agen:
-            if llm_response.live_session_resumption_update:
-              logger.info(
-                  'Update session resumption handle:'
-                  f' {llm_response.live_session_resumption_update}.'
-              )
-              invocation_context.live_session_resumption_handle = (
-                  llm_response.live_session_resumption_update.new_handle
-              )
-            model_response_event = Event(
-                id=Event.new_id(),
-                invocation_id=invocation_context.invocation_id,
-                author=get_author_for_event(llm_response),
-            )
-
-            async with Aclosing(
-                self._postprocess_live(
-                    invocation_context,
-                    llm_request,
-                    llm_response,
-                    model_response_event,
-                )
-            ) as agen:
-              async for event in agen:
-                # Cache output audio chunks from model responses
-                # TODO: support video data
-                if (
-                    invocation_context.run_config.save_live_blob
-                    and event.content
-                    and event.content.parts
-                    and event.content.parts[0].inline_data
-                    and event.content.parts[0].inline_data.mime_type.startswith(
-                        'audio/'
-                    )
-                ):
-                  audio_blob = types.Blob(
-                      data=event.content.parts[0].inline_data.data,
-                      mime_type=event.content.parts[0].inline_data.mime_type,
-                  )
-                  self.audio_cache_manager.cache_audio(
-                      invocation_context, audio_blob, cache_type='output'
-                  )
-
-                yield event
-        # Give opportunity for other tasks to run.
-        await asyncio.sleep(0)
-    except ConnectionClosedOK:
-      pass
+    async with Aclosing(
+        _live_llm_flow.receive_from_model(
+            self, llm_connection, invocation_context, llm_request
+        )
+    ) as agen:
+      async for event in agen:
+        yield event
 
   async def run_async(
       self, invocation_context: InvocationContext
@@ -375,68 +415,69 @@ class BaseLlmFlow(ABC):
           logger.warning('The last event is partial, which is not expected.')
         break
 
+  async def _replay_function_calls(
+      self,
+      invocation_context: InvocationContext,
+      model_response_event: Event,
+      llm_request: LlmRequest,
+  ) -> AsyncGenerator[Event, None]:
+    """Runs `model_response_event`'s function calls, re-issuing event ids.
+
+    A node that interrupts mid-call raises `NodeInterruptedError`, which is a
+    `BaseException` specifically so intermediate handlers do not swallow it.
+    It is left to propagate: `NodeRunner` catches it and reads the interrupt
+    ids off the context, which `ctx.run_node` populated before raising.
+    """
+    async with Aclosing(
+        self._postprocess_handle_function_calls_async(
+            invocation_context, model_response_event, llm_request
+        )
+    ) as agen:
+      async for event in agen:
+        event.id = Event.new_id()
+        yield event
+
   async def _run_one_step_async(
       self,
       invocation_context: InvocationContext,
   ) -> AsyncGenerator[Event, None]:
     """One step means one LLM call."""
     llm_request = LlmRequest()
+    run_config = _require_run_config(invocation_context)
 
     # Preprocess before calling the LLM.
+    preprocess_yielded_final_response = False
     async with Aclosing(
         self._preprocess_async(invocation_context, llm_request)
     ) as agen:
       async for event in agen:
+        if event.get_function_responses() and event.is_final_response():
+          preprocess_yielded_final_response = True
         yield event
-    if invocation_context.end_invocation:
+    if invocation_context.end_invocation or preprocess_yielded_final_response:
       return
 
-    # Resume the LLM agent based on the last event from the current branch.
-    # 1. User content: continue the normal flow
-    # 2. Function call: call the tool and get the response event.
-    events = invocation_context._get_events(
-        current_invocation=True, current_branch=True
+    # Check if the step should pause or replay function calls from a previous run.
+    resume_decision = decide_step_resume(
+        invocation_context, llm_request.tools_dict
     )
-
-    # Long running tool calls should have been handled before this point.
-    # If there are still long running tool calls, it means the agent is paused
-    # before, and its branch hasn't been resumed yet.
-    if (
-        invocation_context.is_resumable
-        and events
-        and len(events) > 1
-        # TODO: here we are using the last 2 events to decide whether to pause
-        # the invocation. But this is just being optimistic, we should find a
-        # way to pause when the long running tool call is followed by more than
-        # one text responses.
-        and (
-            invocation_context.should_pause_invocation(events[-1])
-            or invocation_context.should_pause_invocation(events[-2])
-        )
-    ):
+    if resume_decision.action is ResumeAction.PAUSE:
       return
-
-    if (
-        invocation_context.is_resumable
-        and events
-        and events[-1].get_function_calls()
-    ):
-      model_response_event = events[-1]
+    if resume_decision.action is ResumeAction.REPLAY_CALLS:
       async with Aclosing(
-          self._postprocess_handle_function_calls_async(
-              invocation_context, model_response_event, llm_request
+          self._replay_function_calls(
+              invocation_context, resume_decision.replay_event(), llm_request
           )
       ) as agen:
         async for event in agen:
-          event.id = Event.new_id()
           yield event
-        return
+      return
 
     # Calls the LLM.
     model_response_event = Event(
         id=Event.new_id(),
         invocation_id=invocation_context.invocation_id,
-        author=invocation_context.agent.name,
+        author=_as_llm_agent(invocation_context).name,
         branch=invocation_context.branch,
     )
     async with Aclosing(
@@ -445,6 +486,14 @@ class BaseLlmFlow(ABC):
         )
     ) as agen:
       async for llm_response in agen:
+        if run_config.support_cfc:
+          # When support_cfc is True, _call_llm_async delegates to run_live,
+          # which already performs full live postprocessing (including tool
+          # execution via handle_function_calls_live). Yield the event directly
+          # to prevent duplicate tool execution in _postprocess_async.
+          yield cast(Event, llm_response)
+          continue
+
         # Postprocess after calling the LLM.
         async with Aclosing(
             self._postprocess_async(
@@ -455,20 +504,32 @@ class BaseLlmFlow(ABC):
             )
         ) as agen:
           async for event in agen:
-            # Update the mutable event id to avoid conflict
-            model_response_event.id = Event.new_id()
-            model_response_event.timestamp = datetime.datetime.now().timestamp()
+            # Partial chunks of one streaming response share the base id; mint a
+            # fresh id only after a complete event so distinct responses differ.
+            if not event.partial:
+              model_response_event.id = Event.new_id()
+            model_response_event.timestamp = platform_time.get_time()
             yield event
 
   async def _preprocess_async(
       self, invocation_context: InvocationContext, llm_request: LlmRequest
   ) -> AsyncGenerator[Event, None]:
-    from ...agents.llm_agent import LlmAgent
-
-    agent = invocation_context.agent
-    if not isinstance(agent, LlmAgent):
+    agent = _as_llm_agent(invocation_context)
+    if not hasattr(agent, 'tools') or not hasattr(agent, 'canonical_model'):
       raise TypeError(
-          f'Expected agent to be an LlmAgent, but got {type(agent)}'
+          'Expected agent to have tools and canonical_model attributes,'
+          f' but got {type(agent)}'
+      )
+
+    # Request defaults; _BasicLlmRequestProcessor merges them onto agent config.
+    # Copied rather than deep copied: http_options can carry a live httpx or
+    # aiohttp client and an SSL context, none of which a deep copy survives.
+    if (
+        invocation_context.run_config
+        and invocation_context.run_config.http_options
+    ):
+      llm_request.config.http_options = copy_http_options(
+          invocation_context.run_config.http_options
       )
 
     # Runs processors.
@@ -479,34 +540,22 @@ class BaseLlmFlow(ABC):
         async for event in agen:
           yield event
 
+    # Resolve toolset authentication before tool listing.
+    # This ensures credentials are ready before get_tools() is called.
+    async with Aclosing(
+        self._resolve_toolset_auth(invocation_context, agent)
+    ) as agen:
+      async for event in agen:
+        yield event
+
+    if invocation_context.end_invocation:
+      return
+
     # Run processors for tools.
+    await _process_agent_tools(invocation_context, llm_request)
 
-    # We may need to wrap some built-in tools if there are other tools
-    # because the built-in tools cannot be used together with other tools.
-    # TODO(b/448114567): Remove once the workaround is no longer needed.
-    multiple_tools = len(agent.tools) > 1
-    for tool_union in agent.tools:
-      tool_context = ToolContext(invocation_context)
-
-      # If it's a toolset, process it first
-      if isinstance(tool_union, BaseToolset):
-        await tool_union.process_llm_request(
-            tool_context=tool_context, llm_request=llm_request
-        )
-
-      from ...agents.llm_agent import _convert_tool_union_to_tools
-
-      # Then process all tools from this tool union
-      tools = await _convert_tool_union_to_tools(
-          tool_union,
-          ReadonlyContext(invocation_context),
-          agent.model,
-          multiple_tools,
-      )
-      for tool in tools:
-        await tool.process_llm_request(
-            tool_context=tool_context, llm_request=llm_request
-        )
+    # Finalize dynamic instructions from tools.
+    await _finalize_dynamic_instructions(invocation_context, llm_request)
 
   async def _postprocess_async(
       self,
@@ -527,6 +576,30 @@ class BaseLlmFlow(ABC):
       A generator of events.
     """
 
+    # A non-streaming turn that finishes with STOP but has no content parts would
+    # otherwise be skipped below and become a silent empty final response;
+    # surface it as an actionable error instead. Streaming is excluded
+    # because a terminal finish-only chunk legitimately follows content already
+    # streamed in earlier chunks.
+    #
+    # This must run before the response processors. Emptiness is a property of
+    # what the model returned, so it can only be judged before local processing
+    # touches the response: a processor may clear the content deliberately to
+    # signal that the flow should continue, as the code execution processor does
+    # once it has run the code and emitted its result.
+    run_config = _require_run_config(invocation_context)
+    if (
+        not llm_response.partial
+        and llm_response.error_code is None
+        and llm_response.finish_reason == types.FinishReason.STOP
+        and (not llm_response.content or not llm_response.content.parts)
+        and run_config.streaming_mode != StreamingMode.SSE
+    ):
+      llm_response.error_code = _NO_CONTENT_ERROR_CODE
+      llm_response.error_message = (
+          llm_response.error_message or _NO_CONTENT_ERROR_MESSAGE
+      )
+
     # Runs processors.
     async with Aclosing(
         self._postprocess_run_processors_async(invocation_context, llm_response)
@@ -540,6 +613,7 @@ class BaseLlmFlow(ABC):
         not llm_response.content
         and not llm_response.error_code
         and not llm_response.interrupted
+        and not llm_response.grounding_metadata
     ):
       return
 
@@ -552,14 +626,11 @@ class BaseLlmFlow(ABC):
     # Handles function calls.
     if model_response_event.get_function_calls():
 
-      if is_feature_enabled(FeatureName.PROGRESSIVE_SSE_STREAMING):
-        # In progressive SSE streaming mode stage 1, we skip partial FC events
-        # Only execute FCs in the final aggregated event (partial=False)
-        if (
-            invocation_context.run_config.streaming_mode == StreamingMode.SSE
-            and model_response_event.partial
-        ):
-          return
+      # Skip partial function call events - they should not trigger execution
+      # since partial events are not saved to session (see runners.py).
+      # Only execute function calls in the non-partial events.
+      if model_response_event.partial:
+        return
 
       async with Aclosing(
           self._postprocess_handle_function_calls_async(
@@ -587,80 +658,17 @@ class BaseLlmFlow(ABC):
     Yields:
       A generator of events.
     """
-
-    # Runs processors.
     async with Aclosing(
-        self._postprocess_run_processors_async(invocation_context, llm_response)
+        _live_llm_flow.postprocess_live_flow(
+            self,
+            invocation_context,
+            llm_request,
+            llm_response,
+            model_response_event,
+        )
     ) as agen:
       async for event in agen:
         yield event
-
-    # Skip the model response event if there is no content and no error code.
-    # This is needed for the code executor to trigger another loop.
-    # But don't skip control events like turn_complete or transcription events.
-    if (
-        not llm_response.content
-        and not llm_response.error_code
-        and not llm_response.interrupted
-        and not llm_response.turn_complete
-        and not llm_response.input_transcription
-        and not llm_response.output_transcription
-        and not llm_response.usage_metadata
-    ):
-      return
-
-    # Handle transcription events ONCE per llm_response, outside the event loop
-    if llm_response.input_transcription:
-      model_response_event.input_transcription = (
-          llm_response.input_transcription
-      )
-      model_response_event.partial = llm_response.partial
-      yield model_response_event
-      return
-
-    if llm_response.output_transcription:
-      model_response_event.output_transcription = (
-          llm_response.output_transcription
-      )
-      model_response_event.partial = llm_response.partial
-      yield model_response_event
-      return
-
-    # Flush audio caches based on control events using configurable settings
-    if invocation_context.run_config.save_live_blob:
-      flushed_events = await self._handle_control_event_flush(
-          invocation_context, llm_response
-      )
-      for event in flushed_events:
-        yield event
-      if flushed_events:
-        return
-
-    # Builds the event.
-    model_response_event = self._finalize_model_response_event(
-        llm_request, llm_response, model_response_event
-    )
-    yield model_response_event
-
-    # Handles function calls.
-    if model_response_event.get_function_calls():
-      function_response_event = await functions.handle_function_calls_live(
-          invocation_context, model_response_event, llm_request.tools_dict
-      )
-      # Always yield the function response event first
-      yield function_response_event
-
-      # Check if this is a set_model_response function response
-      if json_response := _output_schema_processor.get_structured_model_response(
-          function_response_event
-      ):
-        # Create and yield a final model response event
-        final_event = (
-            _output_schema_processor.create_final_model_response_event(
-                invocation_context, json_response
-            )
-        )
-        yield final_event
 
   async def _postprocess_run_processors_async(
       self, invocation_context: InvocationContext, llm_response: LlmResponse
@@ -687,6 +695,9 @@ class BaseLlmFlow(ABC):
       if auth_event:
         yield auth_event
 
+        # Interrupt invocation (mirrors _resolve_toolset_auth behavior)
+        invocation_context.end_invocation = True
+
       tool_confirmation_event = functions.generate_request_confirmation_event(
           invocation_context, function_call_event, function_response_event
       )
@@ -707,6 +718,15 @@ class BaseLlmFlow(ABC):
             )
         )
         yield final_event
+
+      # NOTE: This recursive nested execution block is preserved as a backward-compatible
+      # fallback for deprecated execution paths (such as legacy `SequentialAgent`) that
+      # do not run under the modern ADK 2.0 `DynamicNodeScheduler`.
+      #
+      # In modern resumable workflow environments, this block is safely bypassed
+      # because the scheduler wrapper (e.g., `_llm_agent_wrapper.py`) intercepts the
+      # `transfer_to_agent` action at the outer execution frame and exits, returning
+      # control to the top-level coordinator.
       transfer_to_agent = function_response_event.actions.transfer_to_agent
       if transfer_to_agent:
         agent_to_run = self._get_agent_to_run(
@@ -719,10 +739,25 @@ class BaseLlmFlow(ABC):
   def _get_agent_to_run(
       self, invocation_context: InvocationContext, agent_name: str
   ) -> BaseAgent:
-    root_agent = invocation_context.agent.root_agent
+    agent = _require_agent(invocation_context)
+    root_agent = agent.root_agent
     agent_to_run = root_agent.find_agent(agent_name)
     if not agent_to_run:
       raise ValueError(f'Agent {agent_name} not found in the agent tree.')
+
+    from google.adk.agents.llm_agent import LlmAgent
+
+    from .agent_transfer import _get_transfer_targets
+
+    # Restrict transfers to declared targets (or itself) to prevent
+    # unauthorized escalation.
+    if isinstance(agent, LlmAgent) and agent_to_run.name != agent.name:
+      allowed_names = {target.name for target in _get_transfer_targets(agent)}
+      if agent_to_run.name not in allowed_names:
+        raise ValueError(
+            f'Agent {agent.name} is not allowed to transfer to agent'
+            f' {agent_name}.'
+        )
     return agent_to_run
 
   async def _call_llm_async(
@@ -731,63 +766,88 @@ class BaseLlmFlow(ABC):
       llm_request: LlmRequest,
       model_response_event: Event,
   ) -> AsyncGenerator[LlmResponse, None]:
-    # Runs before_model_callback if it exists.
-    if response := await self._handle_before_model_callback(
-        invocation_context, llm_request, model_response_event
-    ):
-      yield response
-      return
 
-    llm_request.config = llm_request.config or types.GenerateContentConfig()
-    llm_request.config.labels = llm_request.config.labels or {}
-
-    # Add agent name as a label to the llm_request. This will help with slicing
-    # the billing reports on a per-agent basis.
-    if _ADK_AGENT_NAME_LABEL_KEY not in llm_request.config.labels:
-      llm_request.config.labels[_ADK_AGENT_NAME_LABEL_KEY] = (
-          invocation_context.agent.name
-      )
-
-    # Calls the LLM.
-    llm = self.__get_llm(invocation_context)
+    agent = _as_llm_agent(invocation_context)
+    run_config = _require_run_config(invocation_context)
+    # Spans opened for the model call stay attached to the ambient context
+    # while this generator is suspended at a yield, so without this the
+    # caller's post-processing -- tool calls, agent transfers -- is traced as
+    # a child of the model call instead of a sibling of it.
+    caller_context = otel_context.get_current()
 
     async def _call_llm_with_tracing() -> AsyncGenerator[LlmResponse, None]:
-      with tracer.start_as_current_span('call_llm'):
-        if invocation_context.run_config.support_cfc:
-          invocation_context.live_request_queue = LiveRequestQueue()
-          responses_generator = self.run_live(invocation_context)
+      with tracer.start_as_current_span('call_llm') as span:
+        # Runs before_model_callback inside the call_llm span so
+        # plugins observe the same span as after/error callbacks.
+        if response := await self._handle_before_model_callback(
+            invocation_context, llm_request, model_response_event
+        ):
+          # The model was never called, but the span still has to carry its
+          # attributes: trace consumers key off the event id attribute and
+          # drop spans that lack it.
+          trace_call_llm(
+              invocation_context,
+              model_response_event.id,
+              llm_request,
+              response,
+              span,
+          )
+          yield response
+          return
+
+        llm_request.config = llm_request.config or types.GenerateContentConfig()
+        llm_request.config.labels = llm_request.config.labels or {}
+
+        # Add agent name as a label to the llm_request. This will help
+        # with slicing billing reports on a per-agent basis.
+        if _ADK_AGENT_NAME_LABEL_KEY not in llm_request.config.labels:
+          llm_request.config.labels[_ADK_AGENT_NAME_LABEL_KEY] = agent.name
+
+        # Calls the LLM.
+        llm = await self.__get_llm(invocation_context)
+
+        # Check if we can make this llm call or not. If the current
+        # call pushes the counter beyond the max set value, then the
+        # execution is stopped right here, and exception is thrown.
+        invocation_context.increment_llm_call_count()
+
+        if run_config.support_cfc:
+          if invocation_context.live_request_queue is None:
+            invocation_context.live_request_queue = LiveRequestQueue()
           async with Aclosing(
               self._run_and_handle_error(
-                  responses_generator,
+                  self.run_live(invocation_context),
                   invocation_context,
                   llm_request,
                   model_response_event,
+                  call_llm_span=span,
               )
           ) as agen:
-            async for llm_response in agen:
-              # Runs after_model_callback if it exists.
-              if altered_llm_response := await self._handle_after_model_callback(
-                  invocation_context, llm_response, model_response_event
-              ):
-                llm_response = altered_llm_response
+            async for event in agen:
+              # Rebind to call_llm span for after_model_callback.
+              with trace.use_span(span, end_on_exit=False):
+                if altered := (
+                    await self._handle_after_model_callback(
+                        invocation_context,
+                        event,
+                        model_response_event,
+                    )
+                ):
+                  event = altered
               # only yield partial response in SSE streaming mode
               if (
-                  invocation_context.run_config.streaming_mode
-                  == StreamingMode.SSE
-                  or not llm_response.partial
+                  run_config.streaming_mode == StreamingMode.SSE
+                  or not event.partial
               ):
-                yield llm_response
-              if llm_response.turn_complete:
-                invocation_context.live_request_queue.close()
+                yield event
+              if event.turn_complete:
+                queue = invocation_context.live_request_queue
+                assert queue is not None
+                queue.close()
         else:
-          # Check if we can make this llm call or not. If the current call
-          # pushes the counter beyond the max set value, then the execution is
-          # stopped right here, and exception is thrown.
-          invocation_context.increment_llm_call_count()
           responses_generator = llm.generate_content_async(
               llm_request,
-              stream=invocation_context.run_config.streaming_mode
-              == StreamingMode.SSE,
+              stream=run_config.streaming_mode == StreamingMode.SSE,
           )
           async with Aclosing(
               self._run_and_handle_error(
@@ -795,6 +855,7 @@ class BaseLlmFlow(ABC):
                   invocation_context,
                   llm_request,
                   model_response_event,
+                  call_llm_span=span,
               )
           ) as agen:
             async for llm_response in agen:
@@ -803,16 +864,44 @@ class BaseLlmFlow(ABC):
                   model_response_event.id,
                   llm_request,
                   llm_response,
+                  span,
               )
-              # Runs after_model_callback if it exists.
-              if altered_llm_response := await self._handle_after_model_callback(
-                  invocation_context, llm_response, model_response_event
-              ):
-                llm_response = altered_llm_response
+              # Rebind to call_llm span for after_model_callback.
+              with trace.use_span(span, end_on_exit=False):
+                if altered := (
+                    await self._handle_after_model_callback(
+                        invocation_context,
+                        llm_response,
+                        model_response_event,
+                    )
+                ):
+                  llm_response = altered
 
               yield llm_response
 
     async with Aclosing(_call_llm_with_tracing()) as agen:
+      async for event in agen:
+        with _use_otel_context(caller_context):
+          yield event
+
+  def _finalize_model_response_event(
+      self,
+      llm_request: LlmRequest,
+      llm_response: LlmResponse,
+      model_response_event: Event,
+  ) -> Event:
+    return finalize_model_response_event(
+        llm_request, llm_response, model_response_event
+    )
+
+  async def _resolve_toolset_auth(
+      self,
+      invocation_context: InvocationContext,
+      agent: LlmAgent,
+  ) -> AsyncGenerator[Event, None]:
+    async with Aclosing(
+        _resolve_toolset_auth(invocation_context, agent)
+    ) as agen:
       async for event in agen:
         yield event
 
@@ -822,36 +911,9 @@ class BaseLlmFlow(ABC):
       llm_request: LlmRequest,
       model_response_event: Event,
   ) -> Optional[LlmResponse]:
-    from ...agents.llm_agent import LlmAgent
-
-    agent = invocation_context.agent
-
-    callback_context = CallbackContext(
-        invocation_context, event_actions=model_response_event.actions
+    return await handle_before_model_callback(
+        invocation_context, llm_request, model_response_event
     )
-
-    # First run callbacks from the plugins.
-    callback_response = (
-        await invocation_context.plugin_manager.run_before_model_callback(
-            callback_context=callback_context,
-            llm_request=llm_request,
-        )
-    )
-    if callback_response:
-      return callback_response
-
-    # If no overrides are provided from the plugins, further run the canonical
-    # callbacks.
-    if not agent.canonical_before_model_callbacks:
-      return
-    for callback in agent.canonical_before_model_callbacks:
-      callback_response = callback(
-          callback_context=callback_context, llm_request=llm_request
-      )
-      if inspect.isawaitable(callback_response):
-        callback_response = await callback_response
-      if callback_response:
-        return callback_response
 
   async def _handle_after_model_callback(
       self,
@@ -859,83 +921,29 @@ class BaseLlmFlow(ABC):
       llm_response: LlmResponse,
       model_response_event: Event,
   ) -> Optional[LlmResponse]:
-    from ...agents.llm_agent import LlmAgent
-
-    agent = invocation_context.agent
-
-    # Add grounding metadata to the response if needed.
-    # TODO(b/448114567): Remove this function once the workaround is no longer needed.
-    async def _maybe_add_grounding_metadata(
-        response: Optional[LlmResponse] = None,
-    ) -> Optional[LlmResponse]:
-      readonly_context = ReadonlyContext(invocation_context)
-      if (tools := invocation_context.canonical_tools_cache) is None:
-        tools = await agent.canonical_tools(readonly_context)
-        invocation_context.canonical_tools_cache = tools
-
-      if not any(tool.name == 'google_search_agent' for tool in tools):
-        return response
-      ground_metadata = invocation_context.session.state.get(
-          'temp:_adk_grounding_metadata', None
-      )
-      if not ground_metadata:
-        return response
-
-      if not response:
-        response = llm_response
-      response.grounding_metadata = ground_metadata
-      return response
-
-    callback_context = CallbackContext(
-        invocation_context, event_actions=model_response_event.actions
+    return await handle_after_model_callback(
+        invocation_context, llm_response, model_response_event
     )
 
-    # First run callbacks from the plugins.
-    callback_response = (
-        await invocation_context.plugin_manager.run_after_model_callback(
-            callback_context=CallbackContext(invocation_context),
-            llm_response=llm_response,
-        )
-    )
-    if callback_response:
-      return await _maybe_add_grounding_metadata(callback_response)
-
-    # If no overrides are provided from the plugins, further run the canonical
-    # callbacks.
-    if not agent.canonical_after_model_callbacks:
-      return await _maybe_add_grounding_metadata()
-    for callback in agent.canonical_after_model_callbacks:
-      callback_response = callback(
-          callback_context=callback_context, llm_response=llm_response
-      )
-      if inspect.isawaitable(callback_response):
-        callback_response = await callback_response
-      if callback_response:
-        return await _maybe_add_grounding_metadata(callback_response)
-    return await _maybe_add_grounding_metadata()
-
-  def _finalize_model_response_event(
+  async def _run_and_handle_error(
       self,
+      response_generator: AsyncGenerator[LlmResponse, None],
+      invocation_context: InvocationContext,
       llm_request: LlmRequest,
-      llm_response: LlmResponse,
       model_response_event: Event,
-  ) -> Event:
-    model_response_event = Event.model_validate({
-        **model_response_event.model_dump(exclude_none=True),
-        **llm_response.model_dump(exclude_none=True),
-    })
-
-    if model_response_event.content:
-      function_calls = model_response_event.get_function_calls()
-      if function_calls:
-        functions.populate_client_function_call_id(model_response_event)
-        model_response_event.long_running_tool_ids = (
-            functions.get_long_running_function_calls(
-                function_calls, llm_request.tools_dict
-            )
+      call_llm_span: Optional[trace.Span] = None,
+  ) -> AsyncGenerator[LlmResponse, None]:
+    async with Aclosing(
+        run_and_handle_error(
+            response_generator,
+            invocation_context,
+            llm_request,
+            model_response_event,
+            call_llm_span=call_llm_span,
         )
-
-    return model_response_event
+    ) as agen:
+      async for response in agen:
+        yield response
 
   async def _handle_control_event_flush(
       self, invocation_context: InvocationContext, llm_response: LlmResponse
@@ -949,110 +957,112 @@ class BaseLlmFlow(ABC):
     Returns:
       A list of Event objects created from the flushed caches.
     """
+    return await _live_llm_flow.handle_control_event_flush(
+        self, invocation_context, llm_response
+    )
 
-    # Log cache statistics if enabled
-    if DEFAULT_ENABLE_CACHE_STATISTICS:
-      stats = self.audio_cache_manager.get_cache_stats(invocation_context)
-      logger.debug('Audio cache stats: %s', stats)
+  async def _get_llm(self, invocation_context: InvocationContext) -> BaseLlm:
+    return await self.__get_llm(invocation_context)
 
-    if llm_response.interrupted:
-      # user interrupts so the model will stop. we can flush model audio here
-      return await self.audio_cache_manager.flush_caches(
-          invocation_context,
-          flush_user_audio=False,
-          flush_model_audio=True,
-      )
-    elif llm_response.turn_complete:
-      # turn completes so we can flush both user and model
-      return await self.audio_cache_manager.flush_caches(
-          invocation_context,
-          flush_user_audio=True,
-          flush_model_audio=True,
-      )
-    elif getattr(llm_response, 'generation_complete', False):
-      # model generation complete so we can flush model audio
-      return await self.audio_cache_manager.flush_caches(
-          invocation_context,
-          flush_user_audio=False,
-          flush_model_audio=True,
-      )
-    return []
+  async def __get_llm(self, invocation_context: InvocationContext) -> BaseLlm:
+    """Resolves the model this invocation should call.
 
-  async def _run_and_handle_error(
-      self,
-      response_generator: AsyncGenerator[LlmResponse, None],
-      invocation_context: InvocationContext,
-      llm_request: LlmRequest,
-      model_response_event: Event,
-  ) -> AsyncGenerator[LlmResponse, None]:
-    """Runs the response generator and processes the error with plugins.
+    Resolution goes through the agent's async accessors, so that it can
+    depend on the invocation and can await. An agent that supplies only the
+    synchronous properties is read through those instead.
+
+    A conformance replay overrides both, because the model it substitutes has
+    to be the one the recording was made against.
 
     Args:
-      response_generator: The response generator to run.
-      invocation_context: The invocation context.
-      llm_request: The LLM request.
-      model_response_event: The model response event.
+      invocation_context: The invocation being served.
 
-    Yields:
-      A generator of LlmResponse.
+    Returns:
+      The model to call for this invocation.
+
+    Raises:
+      TypeError: If the agent supplies no model at all, by either name.
     """
+    agent = _as_llm_agent(invocation_context)
 
-    from ...agents.llm_agent import LlmAgent
+    # Check for conformance test replay mode
+    if config := invocation_context.session.state.get('_adk_replay_config'):
+      from ...cli.conformance._conformance_test_google_llm import _ConformanceTestGemini
 
-    agent = invocation_context.agent
-    if not isinstance(agent, LlmAgent):
+      # Models are stateless, so the current replay state is cached in the
+      # session state to maintain the state across model calls
+      # key: (agent_name, user_message_index)
+      # value: replay index
+      user_message_index = config.get('user_message_index')
+      replay_indexes = config.get('_adk_replay_indexes', {})
+      if (agent.name, user_message_index) not in replay_indexes:
+        replay_indexes[(agent.name, user_message_index)] = 0
+      current_replay_index = replay_indexes[(agent.name, user_message_index)]
+
+      config['current_replay_index'] = current_replay_index
+      config['agent_name'] = agent.name
+      model = _ConformanceTestGemini(
+          config=config,
+      )
+
+      replay_indexes[(agent.name, user_message_index)] = (
+          current_replay_index + 1
+      )
+      config['_adk_replay_indexes'] = replay_indexes
+      return model
+
+    ctx = ReadonlyContext(invocation_context)
+
+    # An agent from outside this package may supply the LlmAgent surface
+    # without subclassing it, and predates the async accessors, so fall back
+    # to the property it does have. See `as_llm_agent`.
+    if invocation_context.live_request_queue is not None:
+      if hasattr(agent, 'canonical_live_model_async'):
+        return await agent.canonical_live_model_async(ctx)
+      return agent.canonical_live_model
+
+    if not hasattr(agent, 'canonical_model'):
       raise TypeError(
-          f'Expected agent to be an LlmAgent, but got {type(agent)}'
+          'Expected agent to have canonical_model attribute,'
+          f' but got {type(agent)}'
       )
+    if hasattr(agent, 'canonical_model_async'):
+      return await agent.canonical_model_async(ctx)
+    return agent.canonical_model
 
-    async def _run_on_model_error_callbacks(
-        *,
-        callback_context: CallbackContext,
-        llm_request: LlmRequest,
-        error: Exception,
-    ) -> Optional[LlmResponse]:
-      error_response = (
-          await invocation_context.plugin_manager.run_on_model_error_callback(
-              callback_context=callback_context,
-              llm_request=llm_request,
-              error=error,
-          )
-      )
-      if error_response is not None:
-        return error_response
 
-      for callback in agent.canonical_on_model_error_callbacks:
-        error_response = callback(
-            callback_context=callback_context,
-            llm_request=llm_request,
-            error=error,
-        )
-        if inspect.isawaitable(error_response):
-          error_response = await error_response
-        if error_response is not None:
-          return error_response
+async def _finalize_dynamic_instructions(
+    invocation_context: InvocationContext,
+    llm_request: LlmRequest,
+) -> None:
+  """Finalizes and resolves dynamic instructions from LlmRequest."""
+  if not llm_request._dynamic_instructions:
+    return
 
-      return None
+  combined_text = '\n\n'.join(llm_request._dynamic_instructions)
 
-    try:
-      async with Aclosing(response_generator) as agen:
-        async for response in agen:
-          yield response
-    except Exception as model_error:
-      callback_context = CallbackContext(
-          invocation_context, event_actions=model_response_event.actions
-      )
-      error_response = await _run_on_model_error_callbacks(
-          callback_context=callback_context,
-          llm_request=llm_request,
-          error=model_error,
-      )
-      if error_response is not None:
-        yield error_response
-      else:
-        raise model_error
+  from ...features import FeatureName
+  from ...features import is_feature_enabled
 
-  def __get_llm(self, invocation_context: InvocationContext) -> BaseLlm:
-    from ...agents.llm_agent import LlmAgent
+  # TODO: Deprecate system_instruction fallback and make user content routing standard.
+  if is_feature_enabled(FeatureName.DYNAMIC_INSTRUCTION_ROUTING):
+    from .contents import _add_instructions_to_user_content
+    from .instructions import _label_dynamic_instruction
 
-    return cast(LlmAgent, invocation_context.agent).canonical_model
+    # Same user-role carrier as the agent's instruction, so same label.
+    instruction_content = types.Content(
+        role='user',
+        parts=[
+            types.Part.from_text(text=_label_dynamic_instruction(combined_text))
+        ],
+    )
+    await _add_instructions_to_user_content(
+        invocation_context,
+        llm_request,
+        [instruction_content],
+    )
+  else:
+    llm_request.append_instructions([combined_text])
+
+  # Clear dynamic instructions to prevent double finalization.
+  llm_request._dynamic_instructions.clear()

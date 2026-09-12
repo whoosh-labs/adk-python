@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ async def test_global_instruction_plugin_with_string():
   mock_callback_context._invocation_context = mock_invocation_context
 
   llm_request = LlmRequest(
-      model="gemini-1.5-flash",
+      model="gemini-2.5-flash",
       config=types.GenerateContentConfig(system_instruction=""),
   )
 
@@ -86,7 +86,7 @@ async def test_global_instruction_plugin_with_instruction_provider():
   mock_callback_context.session = mock_session
 
   llm_request = LlmRequest(
-      model="gemini-1.5-flash",
+      model="gemini-2.5-flash",
       config=types.GenerateContentConfig(system_instruction=""),
   )
 
@@ -122,7 +122,7 @@ async def test_global_instruction_plugin_empty_instruction():
   mock_callback_context._invocation_context = mock_invocation_context
 
   llm_request = LlmRequest(
-      model="gemini-1.5-flash",
+      model="gemini-2.5-flash",
       config=types.GenerateContentConfig(
           system_instruction="Original instruction"
       ),
@@ -159,7 +159,7 @@ async def test_global_instruction_plugin_leads_existing():
   mock_callback_context._invocation_context = mock_invocation_context
 
   llm_request = LlmRequest(
-      model="gemini-1.5-flash",
+      model="gemini-2.5-flash",
       config=types.GenerateContentConfig(
           system_instruction="Existing instructions."
       ),
@@ -194,7 +194,7 @@ async def test_global_instruction_plugin_prepends_to_list():
   mock_callback_context._invocation_context = mock_invocation_context
 
   llm_request = LlmRequest(
-      model="gemini-1.5-flash",
+      model="gemini-2.5-flash",
       config=types.GenerateContentConfig(
           system_instruction=["Existing instruction."]
       ),
@@ -206,3 +206,39 @@ async def test_global_instruction_plugin_prepends_to_list():
 
   expected = ["Global instruction.", "Existing instruction."]
   assert llm_request.config.system_instruction == expected
+
+
+@pytest.mark.asyncio
+async def test_global_instruction_plugin_prepends_to_content():
+  """A Content instruction keeps its parts instead of being flattened."""
+  plugin = GlobalInstructionPlugin(global_instruction="Global instruction.")
+
+  mock_session = Session(
+      app_name="test_app", user_id="test_user", id="test_session", state={}
+  )
+
+  mock_invocation_context = Mock(spec=InvocationContext)
+  mock_invocation_context.session = mock_session
+
+  mock_callback_context = Mock(spec=CallbackContext)
+  mock_callback_context._invocation_context = mock_invocation_context
+
+  llm_request = LlmRequest(
+      model="gemini-2.5-flash",
+      config=types.GenerateContentConfig(
+          system_instruction=types.Content(
+              parts=[types.Part.from_text(text="Existing instruction.")]
+          )
+      ),
+  )
+
+  await plugin.before_model_callback(
+      callback_context=mock_callback_context, llm_request=llm_request
+  )
+
+  result = llm_request.config.system_instruction
+  assert isinstance(result, types.Content)
+  assert [part.text for part in result.parts] == [
+      "Global instruction.",
+      "Existing instruction.",
+  ]

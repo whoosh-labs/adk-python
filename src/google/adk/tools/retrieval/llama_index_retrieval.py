@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,4 +38,10 @@ class LlamaIndexRetrieval(BaseRetrievalTool):
   async def run_async(
       self, *, args: dict[str, Any], tool_context: ToolContext
   ) -> Any:
-    return self.retriever.retrieve(args['query'])[0].text
+    nodes = self.retriever.retrieve(args['query'])
+
+    return (
+        f'No matching result found for the query: {args["query"]}'
+        if not nodes
+        else nodes[0].text
+    )

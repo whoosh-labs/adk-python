@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ from typing import Union
 from pydantic import TypeAdapter
 from typing_extensions import override
 
+from ..errors.tool_execution_error import ToolErrorType
+from ..errors.tool_execution_error import ToolExecutionError
 from ..examples import example_util
 from ..examples.base_example_provider import BaseExampleProvider
 from ..examples.example import Example
@@ -53,7 +55,12 @@ class ExampleTool(BaseTool):
   async def process_llm_request(
       self, *, tool_context: ToolContext, llm_request: LlmRequest
   ) -> None:
-    parts = tool_context.user_content.parts
+    # Nothing to select when there is no user content.
+    user_content = tool_context.user_content
+    if not user_content:
+      return
+
+    parts = user_content.parts
     if not parts or not parts[0].text:
       return
 
@@ -76,16 +83,22 @@ class ExampleTool(BaseTool):
           example_tool_config.examples
       )
       if not isinstance(example_provider, BaseExampleProvider):
-        raise ValueError(
-            'Example provider must be an instance of BaseExampleProvider.'
+        raise ToolExecutionError(
+            message=(
+                'Example provider must be an instance of BaseExampleProvider.'
+            ),
+            error_type=ToolErrorType.BAD_REQUEST,
         )
       return cls(example_provider)
     elif isinstance(example_tool_config.examples, list):
       return cls(example_tool_config.examples)
     else:
-      raise ValueError(
-          'Example tool config must be a list of examples or a fully-qualified'
-          ' name to a BaseExampleProvider object in code.'
+      raise ToolExecutionError(
+          message=(
+              'Example tool config must be a list of examples or a '
+              'fully-qualified name to a BaseExampleProvider object in code.'
+          ),
+          error_type=ToolErrorType.BAD_REQUEST,
       )
 
 

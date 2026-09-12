@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -552,8 +552,8 @@ async def test_function_rearrangement_preserves_other_content():
 
 
 @pytest.mark.asyncio
-async def test_error_when_function_response_without_matching_call():
-  """Test error when function response has no matching function call."""
+async def test_function_response_without_matching_call_is_dropped():
+  """An orphaned function response is pruned, not raised on."""
   agent = Agent(model="gemini-2.5-flash", name="test_agent")
   llm_request = LlmRequest(model="gemini-2.5-flash")
   invocation_context = await testing_utils.create_invocation_context(
@@ -584,9 +584,295 @@ async def test_error_when_function_response_without_matching_call():
   ]
   invocation_context.session.events = events
 
-  # This should raise a ValueError during processing
-  with pytest.raises(ValueError, match="No function call event found"):
-    async for _ in contents.request_processor.run_async(
-        invocation_context, llm_request
-    ):
-      pass
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  # The orphan is gone and the surrounding turn still reaches the model.
+  assert testing_utils.simplify_contents(llm_request.contents) == [
+      ("user", "Regular message"),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_orphaned_function_response_dropped_mid_history():
+  """An orphan is pruned the same way when it is not the trailing event."""
+  agent = Agent(model="gemini-2.5-flash", name="test_agent")
+  llm_request = LlmRequest(model="gemini-2.5-flash")
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  orphaned_response = types.FunctionResponse(
+      id="no_matching_call",
+      name="orphaned_tool",
+      response={"error": "no matching call"},
+  )
+
+  invocation_context.session.events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("Regular message"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="user",
+          content=types.UserContent(
+              [types.Part(function_response=orphaned_response)]
+          ),
+      ),
+      Event(
+          invocation_id="inv3",
+          author="user",
+          content=types.UserContent("Later message"),
+      ),
+  ]
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  assert testing_utils.simplify_contents(llm_request.contents) == [
+      ("user", "Regular message"),
+      ("user", "Later message"),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_function_call_without_matching_response_is_dropped():
+  """An orphaned function call without response is pruned from contents."""
+  agent = Agent(model="gemini-2.5-flash", name="test_agent")
+  llm_request = LlmRequest(model="gemini-2.5-flash")
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  orphaned_call = types.FunctionCall(
+      id="orphan_call_1",
+      name="search_tool",
+      args={"query": "interrupted"},
+  )
+
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("Search for something"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="test_agent",
+          content=types.ModelContent([types.Part(function_call=orphaned_call)]),
+      ),
+  ]
+  invocation_context.session.events = events
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  assert testing_utils.simplify_contents(llm_request.contents) == [
+      ("user", "Search for something"),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_orphaned_function_call_dropped_mid_history():
+  """An orphaned function call followed by a subsequent user turn is pruned."""
+  agent = Agent(model="gemini-2.5-flash", name="test_agent")
+  llm_request = LlmRequest(model="gemini-2.5-flash")
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  orphaned_call = types.FunctionCall(
+      id="orphan_call_1",
+      name="slow_tool",
+      args={"task": "process"},
+  )
+
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("Run slow tool"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="test_agent",
+          content=types.ModelContent([types.Part(function_call=orphaned_call)]),
+      ),
+      Event(
+          invocation_id="inv3",
+          author="user",
+          content=types.UserContent("Never mind, do this instead"),
+      ),
+  ]
+  invocation_context.session.events = events
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  assert testing_utils.simplify_contents(llm_request.contents) == [
+      ("user", "Run slow tool"),
+      ("user", "Never mind, do this instead"),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_pending_long_running_function_call_preserved_in_contents():
+  """Pending calls marked in long_running_tool_ids survive in contents."""
+  agent = Agent(model="gemini-2.5-flash", name="test_agent")
+  llm_request = LlmRequest(model="gemini-2.5-flash")
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  lr_call = types.FunctionCall(
+      id="lr_call_1",
+      name="long_running_op",
+      args={"op": "start"},
+  )
+
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("Start long running op"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="test_agent",
+          long_running_tool_ids={"lr_call_1"},
+          content=types.ModelContent([types.Part(function_call=lr_call)]),
+      ),
+  ]
+  invocation_context.session.events = events
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  calls = [
+      p.function_call
+      for c in llm_request.contents
+      for p in c.parts or []
+      if p.function_call
+  ]
+  assert len(calls) == 1
+  assert calls[0].id == "lr_call_1"
+
+
+@pytest.mark.asyncio
+async def test_orphaned_function_call_preserves_surrounding_text_in_turn():
+  """Text parts in the model turn survive even when orphaned call is pruned."""
+  agent = Agent(model="gemini-2.5-flash", name="test_agent")
+  llm_request = LlmRequest(model="gemini-2.5-flash")
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  orphaned_call = types.FunctionCall(
+      id="orphan_call_1",
+      name="failing_tool",
+      args={},
+  )
+
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("Hello"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="test_agent",
+          content=types.ModelContent([
+              types.Part(text="Thinking about this..."),
+              types.Part(function_call=orphaned_call),
+          ]),
+      ),
+      Event(
+          invocation_id="inv3",
+          author="user",
+          content=types.UserContent("Cancel"),
+      ),
+  ]
+  invocation_context.session.events = events
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  assert testing_utils.simplify_contents(llm_request.contents) == [
+      ("user", "Hello"),
+      ("model", "Thinking about this..."),
+      ("user", "Cancel"),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_trailing_orphaned_call_does_not_trigger_latest_response_rearranger():
+  """Dropping trailing orphaned call must not trigger latest-response rearranger to prune turns."""
+  agent = Agent(model="gemini-2.5-flash", name="test_agent")
+  llm_request = LlmRequest(model="gemini-2.5-flash")
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  call_1 = types.FunctionCall(id="c1", name="async_tool", args={})
+  resp_1 = types.FunctionResponse(
+      id="c1", name="async_tool", response={"status": "done"}
+  )
+  orphan_call = types.FunctionCall(id="c2", name="interrupted_tool", args={})
+
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("start async tool"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="test_agent",
+          content=types.ModelContent([types.Part(function_call=call_1)]),
+      ),
+      Event(
+          invocation_id="inv3",
+          author="user",
+          content=types.UserContent("while waiting, tell me a joke"),
+      ),
+      Event(
+          invocation_id="inv4",
+          author="test_agent",
+          content=types.ModelContent("Why did the chicken cross the road?"),
+      ),
+      Event(
+          invocation_id="inv5",
+          author="user",
+          content=types.UserContent([types.Part(function_response=resp_1)]),
+      ),
+      Event(
+          invocation_id="inv6",
+          author="test_agent",
+          content=types.ModelContent([types.Part(function_call=orphan_call)]),
+      ),
+  ]
+  invocation_context.session.events = events
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  simplified = testing_utils.simplify_contents(llm_request.contents)
+  assert ("user", "while waiting, tell me a joke") in simplified
+  assert ("model", "Why did the chicken cross the road?") in simplified

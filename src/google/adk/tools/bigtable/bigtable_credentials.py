@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,8 @@
 
 from __future__ import annotations
 
-from ...utils.feature_decorator import experimental
+from ...features import experimental
+from ...features import FeatureName
 from .._google_credentials import BaseGoogleCredentialsConfig
 
 BIGTABLE_TOKEN_CACHE_KEY = "bigtable_token_cache"
@@ -24,7 +25,7 @@ BIGTABLE_DEFAULT_SCOPE = [
 ]
 
 
-@experimental
+@experimental(FeatureName.GOOGLE_CREDENTIALS_CONFIG)
 class BigtableCredentialsConfig(BaseGoogleCredentialsConfig):
   """Bigtable Credentials Configuration for Google API tools (Experimental).
 
@@ -33,7 +34,9 @@ class BigtableCredentialsConfig(BaseGoogleCredentialsConfig):
 
   def __post_init__(self) -> BigtableCredentialsConfig:
     """Populate default scope if scopes is None."""
-    super().__post_init__()
+    # pydantic wraps the base @model_validator in a descriptor proxy that mypy
+    # does not treat as callable; it binds to the function normally at runtime.
+    super().__post_init__()  # type: ignore[operator]
 
     if not self.scopes:
       self.scopes = BIGTABLE_DEFAULT_SCOPE

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Hello world agent from agent 1.0 revised to be defined with get_agent_async
-# instead of root_agent - https://colab.sandbox.google.com/drive/1Zq-nqmgK0nCERCv8jKIaoeTTgbNn6oSo?resourcekey=0-GYaz9pFT4wY8CI8Cvjy5GA#scrollTo=u3X3XwDOaCv9
+# Hello world agent defined with get_agent_async instead of root_agent.
 import contextlib
 import random
 from typing import Optional
@@ -68,7 +67,7 @@ async def get_agent_async() -> (
 ):
   """Returns the root agent."""
   root_agent = Agent(
-      model='gemini-2.0-flash-001',
+      model='gemini-2.5-flash',
       name='data_processing_agent',
       instruction="""
       You roll dice and answer questions about the outcome of the dice rolls.

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 from typing import Optional
+from typing import Protocol
 
 from llama_index.core import SimpleDirectoryReader
 from llama_index.core import VectorStoreIndex
@@ -28,11 +30,19 @@ from .llama_index_retrieval import LlamaIndexRetrieval
 logger = logging.getLogger("google_adk." + __name__)
 
 
+class _EmbeddingFactory(Protocol):
+
+  def __call__(
+      self, *, model_name: str, embed_batch_size: int
+  ) -> BaseEmbedding:
+    ...
+
+
 def _get_default_embedding_model() -> BaseEmbedding:
   """Get the default Google Gemini embedding model.
 
   Returns:
-    GoogleGenAIEmbedding instance configured with text-embedding-004 model.
+    GoogleGenAIEmbedding instance configured with gemini-embedding-2-preview model.
 
   Raises:
     ImportError: If llama-index-embeddings-google-genai package is not installed.
@@ -40,7 +50,11 @@ def _get_default_embedding_model() -> BaseEmbedding:
   try:
     from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 
-    return GoogleGenAIEmbedding(model_name="text-embedding-004")
+    factory = cast(_EmbeddingFactory, GoogleGenAIEmbedding)
+    return factory(
+        model_name="gemini-embedding-2-preview",
+        embed_batch_size=1,
+    )
   except ImportError as e:
     raise ImportError(
         "llama-index-embeddings-google-genai package not found. "
@@ -65,7 +79,7 @@ class FilesRetrieval(LlamaIndexRetrieval):
       description: Description of the tool.
       input_dir: Directory path containing files to index.
       embedding_model: Optional custom embedding model. If None, defaults to
-        Google's text-embedding-004 model.
+        Google's gemini-embedding-2-preview model.
     """
     self.input_dir = input_dir
 

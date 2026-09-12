@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import abc
 from typing import List
+from typing import Optional
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
-from ..agents.invocation_context import InvocationContext
+if TYPE_CHECKING:
+  from ..agents.invocation_context import InvocationContext
 from .code_execution_utils import CodeExecutionInput
 from .code_execution_utils import CodeExecutionResult
 
@@ -41,6 +44,7 @@ class BaseCodeExecutor(BaseModel):
       code blocks.
     execution_result_delimiters: The delimiters to format the code execution
       result.
+    timeout_seconds: The fallback timeout in seconds for the code execution.
   """
 
   optimize_data_file: bool = False
@@ -73,6 +77,9 @@ class BaseCodeExecutor(BaseModel):
 
   execution_result_delimiters: tuple[str, str] = ('```tool_output\n', '\n```')
   """The delimiters to format the code execution result."""
+
+  timeout_seconds: Optional[int] = None
+  """The timeout in seconds for the code execution."""
 
   @abc.abstractmethod
   def execute_code(

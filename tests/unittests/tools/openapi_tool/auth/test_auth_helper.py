@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+from unittest.mock import AsyncMock
+from unittest.mock import Mock
 from unittest.mock import patch
 
 from fastapi.openapi.models import APIKey
@@ -27,7 +30,10 @@ from google.adk.auth.auth_credential import HttpCredentials
 from google.adk.auth.auth_credential import ServiceAccount
 from google.adk.auth.auth_credential import ServiceAccountCredential
 from google.adk.auth.auth_schemes import AuthSchemeType
+from google.adk.auth.auth_schemes import CustomAuthScheme
 from google.adk.auth.auth_schemes import OpenIdConnectWithConfig
+from google.adk.auth.auth_tool import AuthConfig
+from google.adk.auth.credential_manager import CredentialManager
 from google.adk.tools.openapi_tool.auth.auth_helpers import credential_to_param
 from google.adk.tools.openapi_tool.auth.auth_helpers import dict_to_auth_scheme
 from google.adk.tools.openapi_tool.auth.auth_helpers import INTERNAL_AUTH_PREFIX
@@ -36,8 +42,8 @@ from google.adk.tools.openapi_tool.auth.auth_helpers import openid_url_to_scheme
 from google.adk.tools.openapi_tool.auth.auth_helpers import service_account_dict_to_scheme_credential
 from google.adk.tools.openapi_tool.auth.auth_helpers import service_account_scheme_credential
 from google.adk.tools.openapi_tool.auth.auth_helpers import token_to_scheme_credential
+import httpx
 import pytest
-import requests
 
 
 def test_token_to_scheme_credential_api_key_header():
@@ -133,8 +139,10 @@ def test_service_account_dict_to_scheme_credential():
 
   scheme, credential = service_account_dict_to_scheme_credential(config, scopes)
 
-  assert isinstance(scheme, HTTPBearer)
-  assert scheme.bearerFormat == "JWT"
+  assert isinstance(scheme, OAuth2)
+  assert scheme.flows is not None
+  assert scheme.flows.clientCredentials is not None
+  assert scheme.flows.clientCredentials.tokenUrl
   assert credential.auth_type == AuthCredentialTypes.SERVICE_ACCOUNT
   assert credential.service_account.scopes == scopes
   assert (
@@ -163,10 +171,52 @@ def test_service_account_scheme_credential():
 
   scheme, credential = service_account_scheme_credential(config)
 
-  assert isinstance(scheme, HTTPBearer)
-  assert scheme.bearerFormat == "JWT"
+  assert isinstance(scheme, OAuth2)
+  assert scheme.flows is not None
+  assert scheme.flows.clientCredentials is not None
+  assert scheme.flows.clientCredentials.tokenUrl
   assert credential.auth_type == AuthCredentialTypes.SERVICE_ACCOUNT
   assert credential.service_account == config
+
+
+@pytest.mark.asyncio
+async def test_service_account_helper_scheme_allows_credential_manager_exchange():
+  """SA helpers must yield a client-credentials scheme (#6656).
+
+  With HTTPBearer, CredentialManager treated the SA as needing interactive
+  auth and returned None (adk_request_credential) instead of exchanging it.
+  """
+  scheme, credential = service_account_scheme_credential(
+      ServiceAccount(
+          use_default_credential=True,
+          scopes=["https://www.googleapis.com/auth/cloud-platform"],
+      )
+  )
+  manager = CredentialManager(
+      AuthConfig(auth_scheme=scheme, raw_auth_credential=credential)
+  )
+  assert manager._is_client_credentials_flow()  # pylint: disable=protected-access
+
+  exchanged = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="bearer",
+          credentials=HttpCredentials(token="sa-access-token"),
+      ),
+  )
+  manager._load_existing_credential = AsyncMock(return_value=None)  # pylint: disable=protected-access
+  manager._exchange_credential = AsyncMock(return_value=(exchanged, True))  # pylint: disable=protected-access
+  manager._refresh_credential = AsyncMock(return_value=(exchanged, False))  # pylint: disable=protected-access
+  manager._save_credential = AsyncMock()  # pylint: disable=protected-access
+
+  ctx = Mock()
+  ctx.get_auth_response = Mock(return_value=None)
+  result = await manager.get_auth_credential(ctx)
+
+  assert result is not None
+  assert result.auth_type == AuthCredentialTypes.HTTP
+  assert result.http.credentials.token == "sa-access-token"
+  manager._exchange_credential.assert_awaited_once()  # pylint: disable=protected-access
 
 
 def test_openid_dict_to_scheme_credential():
@@ -272,7 +322,7 @@ def test_openid_dict_to_scheme_credential_missing_credential_fields():
     openid_dict_to_scheme_credential(config_dict, scopes, credential_dict)
 
 
-@patch("requests.get")
+@patch("httpx.get")
 def test_openid_url_to_scheme_credential(mock_get):
   mock_response = {
       "authorization_endpoint": "auth_url",
@@ -303,7 +353,7 @@ def test_openid_url_to_scheme_credential(mock_get):
   mock_get.assert_called_once_with("openid_url", timeout=10)
 
 
-@patch("requests.get")
+@patch("httpx.get")
 def test_openid_url_to_scheme_credential_no_openid_url(mock_get):
   mock_response = {
       "authorization_endpoint": "auth_url",
@@ -326,9 +376,9 @@ def test_openid_url_to_scheme_credential_no_openid_url(mock_get):
   assert scheme.openIdConnectUrl == "openid_url"
 
 
-@patch("requests.get")
+@patch("httpx.get")
 def test_openid_url_to_scheme_credential_request_exception(mock_get):
-  mock_get.side_effect = requests.exceptions.RequestException("Test Error")
+  mock_get.side_effect = httpx.RequestError("Test Error", request=None)
   credential_dict = {"client_id": "client_id", "client_secret": "client_secret"}
 
   with pytest.raises(
@@ -337,7 +387,7 @@ def test_openid_url_to_scheme_credential_request_exception(mock_get):
     openid_url_to_scheme_credential("openid_url", [], credential_dict)
 
 
-@patch("requests.get")
+@patch("httpx.get")
 def test_openid_url_to_scheme_credential_invalid_json(mock_get):
   mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
   mock_get.return_value.raise_for_status.return_value = None
@@ -411,7 +461,7 @@ def test_credential_to_param_http_bearer():
   assert kwargs == {INTERNAL_AUTH_PREFIX + "Authorization": "Bearer test_token"}
 
 
-def test_credential_to_param_http_basic_not_supported():
+def test_credential_to_param_http_basic():
   auth_scheme = HTTPBase(scheme="basic")
   auth_credential = AuthCredential(
       auth_type=AuthCredentialTypes.HTTP,
@@ -421,15 +471,137 @@ def test_credential_to_param_http_basic_not_supported():
       ),
   )
 
-  with pytest.raises(
-      NotImplementedError, match="Basic Authentication is not supported."
-  ):
+  param, kwargs = credential_to_param(auth_scheme, auth_credential)
+
+  expected_credentials = base64.b64encode(b"user:password").decode("ascii")
+  assert param.original_name == "Authorization"
+  assert param.param_location == "header"
+  assert kwargs == {
+      INTERNAL_AUTH_PREFIX + "Authorization": f"Basic {expected_credentials}"
+  }
+
+
+def test_credential_to_param_http_basic_missing_password():
+  auth_scheme = HTTPBase(scheme="basic")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="basic",
+          credentials=HttpCredentials(username="user"),
+      ),
+  )
+
+  param, kwargs = credential_to_param(auth_scheme, auth_credential)
+
+  expected_credentials = base64.b64encode(b"user:").decode("ascii")
+  assert param.original_name == "Authorization"
+  assert param.param_location == "header"
+  assert kwargs == {
+      INTERNAL_AUTH_PREFIX + "Authorization": f"Basic {expected_credentials}"
+  }
+
+
+def test_credential_to_param_http_basic_missing_username():
+  auth_scheme = HTTPBase(scheme="basic")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="basic",
+          credentials=HttpCredentials(password="password"),
+      ),
+  )
+
+  param, kwargs = credential_to_param(auth_scheme, auth_credential)
+
+  expected_credentials = base64.b64encode(b":password").decode("ascii")
+  assert param.original_name == "Authorization"
+  assert param.param_location == "header"
+  assert kwargs == {
+      INTERNAL_AUTH_PREFIX + "Authorization": f"Basic {expected_credentials}"
+  }
+
+
+def test_credential_to_param_http_basic_missing_username_and_password():
+  auth_scheme = HTTPBase(scheme="basic")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="basic",
+          credentials=HttpCredentials(),
+      ),
+  )
+
+  with pytest.raises(ValueError, match="Invalid HTTP auth credentials"):
     credential_to_param(auth_scheme, auth_credential)
+
+
+def test_credential_to_param_http_basic_colon_in_username():
+  auth_scheme = HTTPBase(scheme="basic")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="basic",
+          credentials=HttpCredentials(
+              username="user:name", password="password"
+          ),
+      ),
+  )
+
+  with pytest.raises(ValueError, match="Invalid HTTP auth credentials"):
+    credential_to_param(auth_scheme, auth_credential)
+
+
+def test_credential_to_param_http_digest():
+  auth_scheme = HTTPBase(scheme="digest")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="digest",
+          credentials=HttpCredentials(username="user", password="password"),
+      ),
+  )
+
+  with pytest.raises(ValueError, match="Invalid HTTP auth credentials"):
+    credential_to_param(auth_scheme, auth_credential)
+
+
+def test_credential_to_param_http_basic_custom_auth_scheme():
+  auth_scheme = CustomAuthScheme(type="http")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth(
+          scheme="basic",
+          credentials=HttpCredentials(username="user", password="password"),
+      ),
+  )
+
+  param, kwargs = credential_to_param(auth_scheme, auth_credential)
+
+  expected_credentials = base64.b64encode(b"user:password").decode("ascii")
+  assert param.original_name == "Authorization"
+  assert param.description == "Basic authentication"
+  assert kwargs == {
+      INTERNAL_AUTH_PREFIX + "Authorization": f"Basic {expected_credentials}"
+  }
 
 
 def test_credential_to_param_http_invalid_credentials_no_http():
   auth_scheme = HTTPBase(scheme="basic")
   auth_credential = AuthCredential(auth_type=AuthCredentialTypes.HTTP)
+
+  with pytest.raises(ValueError, match="Invalid HTTP auth credentials"):
+    credential_to_param(auth_scheme, auth_credential)
+
+
+def test_credential_to_param_http_basic_scheme_none():
+  auth_scheme = HTTPBase(scheme="basic")
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.HTTP,
+      http=HttpAuth.model_construct(
+          scheme=None,
+          credentials=HttpCredentials(username="user", password="password"),
+      ),
+  )
 
   with pytest.raises(ValueError, match="Invalid HTTP auth credentials"):
     credential_to_param(auth_scheme, auth_credential)

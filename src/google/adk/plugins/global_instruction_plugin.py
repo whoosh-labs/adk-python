@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +25,34 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.utils import instructions_utils
+from google.genai import types
 
 if TYPE_CHECKING:
   from google.adk.agents.llm_agent import InstructionProvider
-  from google.adk.agents.llm_agent import LlmAgent
+
+
+def _prepend_instruction(
+    prefix: str, existing: types.ContentUnion
+) -> types.ContentUnion:
+  """Prepends text while preserving every supported SDK content shape."""
+  if isinstance(existing, str):
+    return f"{prefix}\n\n{existing}"
+  if isinstance(existing, types.Content):
+    return existing.model_copy(
+        update={
+            "parts": [
+                types.Part.from_text(text=prefix),
+                *(existing.parts or []),
+            ]
+        }
+    )
+
+  parts: list[types.PartUnion]
+  if isinstance(existing, list):
+    parts = list(existing)
+  else:
+    parts = [existing]
+  return [prefix, *parts]
 
 
 class GlobalInstructionPlugin(BasePlugin):
@@ -93,15 +117,9 @@ class GlobalInstructionPlugin(BasePlugin):
       llm_request.config.system_instruction = final_global_instruction
       return None
 
-    if isinstance(existing_instruction, str):
-      llm_request.config.system_instruction = (
-          f"{final_global_instruction}\n\n{existing_instruction}"
-      )
-    else:  # It's an Iterable
-      # Convert to list to allow prepending
-      new_instruction_list = [final_global_instruction]
-      new_instruction_list.extend(list(existing_instruction))
-      llm_request.config.system_instruction = new_instruction_list
+    llm_request.config.system_instruction = _prepend_instruction(
+        final_global_instruction, existing_instruction
+    )
 
     return None
 

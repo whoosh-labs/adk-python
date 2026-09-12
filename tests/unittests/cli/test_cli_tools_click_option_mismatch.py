@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ from google.adk.cli.cli_tools_click import cli_api_server
 from google.adk.cli.cli_tools_click import cli_create_cmd
 from google.adk.cli.cli_tools_click import cli_deploy_agent_engine
 from google.adk.cli.cli_tools_click import cli_deploy_cloud_run
+from google.adk.cli.cli_tools_click import cli_deploy_docker
 from google.adk.cli.cli_tools_click import cli_deploy_gke
 from google.adk.cli.cli_tools_click import cli_eval
 from google.adk.cli.cli_tools_click import cli_run
@@ -94,7 +95,12 @@ def test_adk_run():
   run_command = _get_command_by_name(main.commands, "run")
 
   assert run_command is not None, "Run command not found"
-  _check_options_in_parameters(run_command, cli_run.callback, "run")
+  _check_options_in_parameters(
+      run_command,
+      cli_run.callback,
+      "run",
+      ignore_params={"verbose", "enable_features", "disable_features"},
+  )
 
 
 def test_adk_eval():
@@ -102,7 +108,12 @@ def test_adk_eval():
   eval_command = _get_command_by_name(main.commands, "eval")
 
   assert eval_command is not None, "Eval command not found"
-  _check_options_in_parameters(eval_command, cli_eval.callback, "eval")
+  _check_options_in_parameters(
+      eval_command,
+      cli_eval.callback,
+      "eval",
+      ignore_params={"enable_features", "disable_features"},
+  )
 
 
 def test_adk_web():
@@ -111,7 +122,10 @@ def test_adk_web():
 
   assert web_command is not None, "Web command not found"
   _check_options_in_parameters(
-      web_command, cli_web.callback, "web", ignore_params={"verbose"}
+      web_command,
+      cli_web.callback,
+      "web",
+      ignore_params={"verbose", "enable_features", "disable_features"},
   )
 
 
@@ -124,7 +138,7 @@ def test_adk_api_server():
       api_server_command,
       cli_api_server.callback,
       "api_server",
-      ignore_params={"verbose"},
+      ignore_params={"verbose", "enable_features", "disable_features"},
   )
 
 
@@ -163,3 +177,33 @@ def test_adk_deploy_gke():
   _check_options_in_parameters(
       gke_command, cli_deploy_gke.callback, "deploy gke"
   )
+
+
+def test_adk_deploy_docker():
+  """Test that cli_deploy_docker has all required parameters."""
+  docker_command = _get_command_by_name(deploy.commands, "docker")
+
+  assert docker_command is not None, "Docker deploy command not found"
+  _check_options_in_parameters(
+      docker_command,
+      cli_deploy_docker.callback,
+      "deploy docker",
+      ignore_params={"verbose", "ctx"},
+  )
+
+
+def test_adk_deploy_cloud_run_no_duplicate_options():
+  """Test that cli_deploy_cloud_run does not define duplicate Click options."""
+  cloud_run_command = _get_command_by_name(deploy.commands, "cloud_run")
+  assert cloud_run_command is not None, "Cloud Run deploy command not found"
+  option_names = [
+      param.name
+      for param in cloud_run_command.params
+      if isinstance(param, click.Option)
+  ]
+  duplicate_options = [
+      name for name in set(option_names) if option_names.count(name) > 1
+  ]
+  assert (
+      not duplicate_options
+  ), f"Duplicate options found in deploy cloud_run: {duplicate_options}"

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+from typing import Callable
 from typing import List
-from typing import Optional
-from typing import Union
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.spanner import metadata_tool
@@ -24,11 +24,12 @@ from google.adk.tools.spanner import query_tool
 from google.adk.tools.spanner import search_tool
 from typing_extensions import override
 
+from ...features import experimental
+from ...features import FeatureName
 from ...tools.base_tool import BaseTool
 from ...tools.base_toolset import BaseToolset
 from ...tools.base_toolset import ToolPredicate
 from ...tools.google_tool import GoogleTool
-from ...utils.feature_decorator import experimental
 from .settings import Capabilities
 from .settings import SpannerToolSettings
 from .spanner_credentials import SpannerCredentialsConfig
@@ -36,7 +37,7 @@ from .spanner_credentials import SpannerCredentialsConfig
 DEFAULT_SPANNER_TOOL_NAME_PREFIX = "spanner"
 
 
-@experimental
+@experimental(FeatureName.SPANNER_TOOLSET)
 class SpannerToolset(BaseToolset):
   """Spanner Toolset contains tools for interacting with Spanner data, database and table information.
 
@@ -47,14 +48,16 @@ class SpannerToolset(BaseToolset):
     - spanner_list_named_schemas
     - spanner_get_table_schema
     - spanner_execute_sql
+    - spanner_similarity_search
+    - spanner_vector_store_similarity_search
   """
 
   def __init__(
       self,
       *,
-      tool_filter: Optional[Union[ToolPredicate, List[str]]] = None,
-      credentials_config: Optional[SpannerCredentialsConfig] = None,
-      spanner_tool_settings: Optional[SpannerToolSettings] = None,
+      tool_filter: ToolPredicate | list[str] | None = None,
+      credentials_config: SpannerCredentialsConfig | None = None,
+      spanner_tool_settings: SpannerToolSettings | None = None,
   ):
     super().__init__(
         tool_filter=tool_filter,
@@ -68,7 +71,7 @@ class SpannerToolset(BaseToolset):
     )
 
   def _is_tool_selected(
-      self, tool: BaseTool, readonly_context: ReadonlyContext
+      self, tool: BaseTool, readonly_context: ReadonlyContext | None
   ) -> bool:
     if self.tool_filter is None:
       return True
@@ -83,23 +86,24 @@ class SpannerToolset(BaseToolset):
 
   @override
   async def get_tools(
-      self, readonly_context: Optional[ReadonlyContext] = None
+      self, readonly_context: ReadonlyContext | None = None
   ) -> List[BaseTool]:
     """Get tools from the toolset."""
+    # Metadata tools
+    funcs: list[Callable[..., Any]] = [
+        metadata_tool.list_table_names,
+        metadata_tool.list_table_indexes,
+        metadata_tool.list_table_index_columns,
+        metadata_tool.list_named_schemas,
+        metadata_tool.get_table_schema,
+    ]
     all_tools = [
         GoogleTool(
             func=func,
             credentials_config=self._credentials_config,
             tool_settings=self._tool_settings,
         )
-        for func in [
-            # Metadata tools
-            metadata_tool.list_table_names,
-            metadata_tool.list_table_indexes,
-            metadata_tool.list_table_index_columns,
-            metadata_tool.list_named_schemas,
-            metadata_tool.get_table_schema,
-        ]
+        for func in funcs
     ]
 
     # Query tools
@@ -109,7 +113,7 @@ class SpannerToolset(BaseToolset):
     ):
       all_tools.append(
           GoogleTool(
-              func=query_tool.execute_sql,
+              func=query_tool.get_execute_sql(self._tool_settings),
               credentials_config=self._credentials_config,
               tool_settings=self._tool_settings,
           )
@@ -121,6 +125,16 @@ class SpannerToolset(BaseToolset):
               tool_settings=self._tool_settings,
           )
       )
+      if self._tool_settings.vector_store_settings:
+        # Only add the vector store similarity search tool if the vector store
+        # settings are specified.
+        all_tools.append(
+            GoogleTool(
+                func=search_tool.vector_store_similarity_search,
+                credentials_config=self._credentials_config,
+                tool_settings=self._tool_settings,
+            )
+        )
 
     return [
         tool
@@ -129,5 +143,5 @@ class SpannerToolset(BaseToolset):
     ]
 
   @override
-  async def close(self):
+  async def close(self) -> None:
     pass

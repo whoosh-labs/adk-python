@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -60,6 +60,8 @@ class CachePerformanceAnalyzer:
         app_name=app_name,
         user_id=user_id,
     )
+    if session is None:
+      raise ValueError(f"Session not found: {session_id}")
     cache_history = []
 
     for event in session.events:
@@ -111,6 +113,8 @@ class CachePerformanceAnalyzer:
         app_name=app_name,
         user_id=user_id,
     )
+    if session is None:
+      raise ValueError(f"Session not found: {session_id}")
 
     # Collect token metrics from events
     total_prompt_tokens = 0
@@ -144,7 +148,11 @@ class CachePerformanceAnalyzer:
         total_cached_tokens / total_requests if total_requests > 0 else 0.0
     )
 
-    invocations_used = [c.invocations_used for c in cache_history]
+    invocations_used = [
+        c.invocations_used
+        for c in cache_history
+        if c.invocations_used is not None
+    ]
     total_invocations = sum(invocations_used)
 
     return {
@@ -156,7 +164,9 @@ class CachePerformanceAnalyzer:
             else 0
         ),
         "latest_cache": cache_history[-1].cache_name,
-        "cache_refreshes": len(set(c.cache_name for c in cache_history)),
+        "cache_refreshes": len(
+            {c.cache_name for c in cache_history if c.cache_name is not None}
+        ),
         "total_invocations": total_invocations,
         "total_prompt_tokens": total_prompt_tokens,
         "total_cached_tokens": total_cached_tokens,

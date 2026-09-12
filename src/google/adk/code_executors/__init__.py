@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,11 +15,18 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from .base_code_executor import BaseCodeExecutor
-from .built_in_code_executor import BuiltInCodeExecutor
-from .code_executor_context import CodeExecutorContext
 from .unsafe_local_code_executor import UnsafeLocalCodeExecutor
+
+if TYPE_CHECKING:
+  from .agent_engine_sandbox_code_executor import AgentEngineSandboxCodeExecutor
+  from .built_in_code_executor import BuiltInCodeExecutor
+  from .code_executor_context import CodeExecutorContext
+  from .container_code_executor import ContainerCodeExecutor
+  from .gke_code_executor import GkeCodeExecutor
+  from .vertex_ai_code_executor import VertexAiCodeExecutor
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -35,8 +42,16 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
-  if name == 'VertexAiCodeExecutor':
+def __getattr__(name: str) -> object:
+  if name == 'BuiltInCodeExecutor':
+    from .built_in_code_executor import BuiltInCodeExecutor
+
+    return BuiltInCodeExecutor
+  elif name == 'CodeExecutorContext':
+    from .code_executor_context import CodeExecutorContext
+
+    return CodeExecutorContext
+  elif name == 'VertexAiCodeExecutor':
     try:
       from .vertex_ai_code_executor import VertexAiCodeExecutor
 

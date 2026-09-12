@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,15 +15,28 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 import uuid
 
 import kubernetes as k8s
 from kubernetes.watch import Watch
+from pydantic import field_validator
+from typing_extensions import Literal
+from typing_extensions import override
+from typing_extensions import TYPE_CHECKING
 
 from ..agents.invocation_context import InvocationContext
 from .base_code_executor import BaseCodeExecutor
 from .code_execution_utils import CodeExecutionInput
 from .code_execution_utils import CodeExecutionResult
+
+try:
+  from k8s_agent_sandbox import SandboxClient
+except ImportError:
+  SandboxClient = None
+
+if TYPE_CHECKING:
+  from k8s_agent_sandbox import SandboxClient
 
 # Expose these for tests to monkeypatch.
 client = k8s.client
@@ -32,18 +45,38 @@ ApiException = k8s.client.exceptions.ApiException
 
 logger = logging.getLogger("google_adk." + __name__)
 
+# Name of the Job container that runs the user's code, and so the one whose
+# termination status is the status of the execution.
+_CODE_CONTAINER_NAME = "code-runner"
+
 
 class GkeCodeExecutor(BaseCodeExecutor):
-  """Executes Python code in a secure gVisor-sandboxed Pod on GKE.
+  """Executes Python code in a dedicated Pod on GKE.
 
-  This executor securely runs code by dynamically creating a Kubernetes Job for
-  each execution request. The user's code is mounted via a ConfigMap, and the
-  Pod is hardened with a strict security context and resource limits.
+  This executor supports two modes of execution: 'job' and 'sandbox', which do
+  not provide the same isolation.
+
+  Job Mode (default):
+  Securely runs code by dynamically creating a Kubernetes Job for each execution
+  request. The user's code is mounted via a ConfigMap, and the Pod is hardened
+  with a strict security context and resource limits. The Pod also requests the
+  gVisor runtime, so this is the mode that isolates the code from the host
+  kernel.
+
+  Sandbox Mode:
+  Executes code using the Agent Sandbox Client. The Pod is created from a
+  sandbox template already installed in the cluster, so its runtime class and
+  security context come from that template rather than from this executor.
+  This mode requires additional infrastructure to be deployed in the cluster,
+  specifically:
+  - Agent-sandbox controller
+  - Sandbox templates (e.g., python-sandbox-template)
+  - Sandbox router and gateway
 
   Key Features:
-  - Sandboxed execution using the gVisor runtime.
+  - In job mode, sandboxed execution using the gVisor runtime and a
+    secure-by-default Pod configuration (non-root, no privileges).
   - Ephemeral, per-execution environments using Kubernetes Jobs.
-  - Secure-by-default Pod configuration (non-root, no privileges).
   - Automatic garbage collection of completed Jobs and Pods via TTL.
   - Efficient, event-driven waiting using the Kubernetes watch API.
 
@@ -70,6 +103,7 @@ class GkeCodeExecutor(BaseCodeExecutor):
   namespace: str = "default"
   image: str = "python:3.11-slim"
   timeout_seconds: int = 300
+  executor_type: Literal["job", "sandbox"] = "job"
   cpu_requested: str = "200m"
   mem_requested: str = "256Mi"
   # The maximum CPU the container can use, in "millicores". 1000m is 1 full CPU core.
@@ -79,6 +113,10 @@ class GkeCodeExecutor(BaseCodeExecutor):
   kubeconfig_path: str | None = None
   kubeconfig_context: str | None = None
 
+  # Sandbox constants
+  sandbox_gateway_name: str | None = None
+  sandbox_template: str | None = "python-sandbox-template"
+
   _batch_v1: k8s.client.BatchV1Api
   _core_v1: k8s.client.CoreV1Api
 
@@ -86,8 +124,8 @@ class GkeCodeExecutor(BaseCodeExecutor):
       self,
       kubeconfig_path: str | None = None,
       kubeconfig_context: str | None = None,
-      **data,
-  ):
+      **data: object,
+  ) -> None:
     """Initializes the executor and the Kubernetes API clients.
 
     This constructor supports multiple authentication methods:
@@ -136,10 +174,50 @@ class GkeCodeExecutor(BaseCodeExecutor):
     self._batch_v1 = client.BatchV1Api()
     self._core_v1 = client.CoreV1Api()
 
-  def execute_code(
-      self,
-      invocation_context: InvocationContext,
-      code_execution_input: CodeExecutionInput,
+  @field_validator("executor_type")
+  @classmethod
+  def _check_sandbox_dependency(cls, v: str) -> str:
+    if v == "sandbox" and SandboxClient is None:
+      raise ImportError(
+          "k8s-agent-sandbox not found. To use Agent Sandbox, please install"
+          " google-adk with the extensions extra: pip install"
+          " google-adk[extensions]"
+      )
+    return v
+
+  def _execute_in_sandbox(self, code: str) -> CodeExecutionResult:
+    """Executes code using Agent Sandbox Client."""
+    try:
+      with SandboxClient(
+          template_name=self.sandbox_template,
+          gateway_name=self.sandbox_gateway_name,
+          namespace=self.namespace,
+      ) as sandbox:
+        # Execute the code as a python script
+        sandbox.write("script.py", code)
+        result = sandbox.run("python3 script.py")
+
+        return CodeExecutionResult(
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
+        )
+    except RuntimeError as e:
+      logger.error(
+          "SandboxClient failed to initialize or find gateway", exc_info=True
+      )
+      raise RuntimeError(f"Sandbox infrastructure error: {e}") from e
+    except TimeoutError as e:
+      logger.error("Sandbox timed out", exc_info=True)
+      # Returning a result instead of raising allows the Agent to process
+      # the error gracefully.
+      return CodeExecutionResult(stderr=f"Sandbox timed out: {e}")
+    except Exception as e:
+      logger.error("Sandbox execution failed: %s", e, exc_info=True)
+      raise
+
+  def _execute_as_job(
+      self, code: str, invocation_context: InvocationContext
   ) -> CodeExecutionResult:
     """Orchestrates the secure execution of a code snippet on GKE."""
     job_name = f"adk-exec-{uuid.uuid4().hex[:10]}"
@@ -150,7 +228,7 @@ class GkeCodeExecutor(BaseCodeExecutor):
       # 1. Create a ConfigMap to mount LLM-generated code into the Pod.
       # 2. Create a Job that runs the code from the ConfigMap.
       # 3. Set the Job as the ConfigMap's owner for automatic cleanup.
-      self._create_code_configmap(configmap_name, code_execution_input.code)
+      self._create_code_configmap(configmap_name, code)
       job_manifest = self._create_job_manifest(
           job_name, configmap_name, invocation_context
       )
@@ -162,7 +240,6 @@ class GkeCodeExecutor(BaseCodeExecutor):
       logger.info(
           f"Submitted Job '{job_name}' to namespace '{self.namespace}'."
       )
-      logger.debug("Executing code:\n```\n%s\n```", code_execution_input.code)
       return self._watch_job_completion(job_name)
 
     except ApiException as e:
@@ -186,6 +263,20 @@ class GkeCodeExecutor(BaseCodeExecutor):
           stderr=f"An unexpected executor error occurred: {e}"
       )
 
+  @override
+  def execute_code(
+      self,
+      invocation_context: InvocationContext,
+      code_execution_input: CodeExecutionInput,
+  ) -> CodeExecutionResult:
+    """Overrides the base method to route execution based on executor_type."""
+    code = code_execution_input.code
+    if self.executor_type == "sandbox":
+      return self._execute_in_sandbox(code)
+    else:
+      # Fallback to existing GKE Job logic
+      return self._execute_as_job(code, invocation_context)
+
   def _create_job_manifest(
       self,
       job_name: str,
@@ -195,7 +286,7 @@ class GkeCodeExecutor(BaseCodeExecutor):
     """Creates the complete V1Job object with security best practices."""
     # Define the container that will run the code.
     container = k8s.client.V1Container(
-        name="code-runner",
+        name=_CODE_CONTAINER_NAME,
         image=self.image,
         command=["python3", "/app/code.py"],
         volume_mounts=[
@@ -219,6 +310,9 @@ class GkeCodeExecutor(BaseCodeExecutor):
     # Use tolerations to request a gVisor node.
     pod_spec = k8s.client.V1PodSpec(
         restart_policy="Never",
+        # The pod runs model-generated code, so it must not receive a
+        # credential for the cluster it is running in.
+        automount_service_account_token=False,
         containers=[container],
         volumes=[
             k8s.client.V1Volume(
@@ -270,16 +364,25 @@ class GkeCodeExecutor(BaseCodeExecutor):
           timeout_seconds=self.timeout_seconds,
       ):
         job = event["object"]
+        # The Job reports only whether the pod succeeded, so the status the
+        # container terminated with is read from the pod itself. It is absent
+        # when the pod never reached a terminated state, and only then is the
+        # code narrowed to the one the Job's outcome implies.
         if job.status.succeeded:
           watch.stop()
           logger.info(f"Job '{job_name}' succeeded.")
-          logs = self._get_pod_logs(job_name)
-          return CodeExecutionResult(stdout=logs)
+          logs, exit_code = self._get_pod_logs_and_exit_code(job_name)
+          return CodeExecutionResult(
+              stdout=logs, exit_code=0 if exit_code is None else exit_code
+          )
         if job.status.failed:
           watch.stop()
           logger.error(f"Job '{job_name}' failed.")
-          logs = self._get_pod_logs(job_name)
-          return CodeExecutionResult(stderr=f"Job failed. Logs:\n{logs}")
+          logs, exit_code = self._get_pod_logs_and_exit_code(job_name)
+          return CodeExecutionResult(
+              stderr=f"Job failed. Logs:\n{logs}",
+              exit_code=1 if exit_code is None else exit_code,
+          )
 
       # If the loop finishes without returning, the watch timed out.
       raise TimeoutError(
@@ -290,6 +393,25 @@ class GkeCodeExecutor(BaseCodeExecutor):
 
   def _get_pod_logs(self, job_name: str) -> str:
     """Retrieves logs from the pod created by the specified job.
+
+    Raises:
+        RuntimeError: If the pod cannot be found or logs cannot be fetched.
+    """
+    logs, _ = self._get_pod_logs_and_exit_code(job_name)
+    return logs
+
+  def _get_pod_logs_and_exit_code(
+      self, job_name: str
+  ) -> tuple[str, int | None]:
+    """Retrieves the logs and exit code of the pod created by the given job.
+
+    Both are read from a single pod lookup, since the status a container
+    terminated with is only available for as long as the pod its logs come
+    from.
+
+    Returns:
+        The pod's logs, and the status the code container exited with, or None
+        when the pod reports no terminated container to read it from.
 
     Raises:
         RuntimeError: If the pod cannot be found or logs cannot be fetched.
@@ -305,14 +427,33 @@ class GkeCodeExecutor(BaseCodeExecutor):
             f"Could not find Pod for Job '{job_name}' to retrieve logs."
         )
 
-      pod_name = pods.items[0].metadata.name
-      return self._core_v1.read_namespaced_pod_log(
-          name=pod_name, namespace=self.namespace
+      pod = pods.items[0]
+      logs = cast(
+          str,
+          self._core_v1.read_namespaced_pod_log(
+              name=pod.metadata.name, namespace=self.namespace
+          ),
       )
+      return logs, self._get_container_exit_code(pod)
     except ApiException as e:
       raise RuntimeError(
           f"API error retrieving logs for job '{job_name}': {e.reason}"
       ) from e
+
+  def _get_container_exit_code(self, pod: k8s.client.V1Pod) -> int | None:
+    """Reads the status the code container of the given pod exited with.
+
+    Returns:
+        The exit code, or None when the container is absent from the pod's
+        status or has not reached a terminated state.
+    """
+    for container_status in pod.status.container_statuses or []:
+      if container_status.name != _CODE_CONTAINER_NAME:
+        continue
+      state = container_status.state
+      terminated = state.terminated if state else None
+      return terminated.exit_code if terminated else None
+    return None
 
   def _create_code_configmap(self, name: str, code: str) -> None:
     """Creates a ConfigMap to hold the Python code."""

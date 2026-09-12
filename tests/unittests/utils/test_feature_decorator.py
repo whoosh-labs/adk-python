@@ -1,9 +1,33 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import tempfile
 import warnings
 
+from google.adk.utils.feature_decorator import _WARNED_MESSAGES
 from google.adk.utils.feature_decorator import experimental
 from google.adk.utils.feature_decorator import working_in_progress
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_warned_messages():
+  """Let each test observe the first warning for the surfaces it exercises."""
+  _WARNED_MESSAGES.clear()
+  yield
+  _WARNED_MESSAGES.clear()
 
 
 @working_in_progress("in complete feature, don't use yet")
@@ -243,6 +267,24 @@ def test_experimental_class_warns(monkeypatch):
     assert "class may change" in str(w[0].message)
 
 
+def test_experimental_warns_once_per_surface(monkeypatch):
+  """Repeated use of one surface warns once; another surface still warns."""
+  monkeypatch.delenv(
+      "ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", raising=False
+  )
+  with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter("always")
+
+    for _ in range(3):
+      experimental_fn()
+      ExperimentalClass()
+
+    messages = [str(warning.message) for warning in w]
+    assert len(messages) == 2
+    assert any("[EXPERIMENTAL] experimental_fn:" in m for m in messages)
+    assert any("[EXPERIMENTAL] ExperimentalClass:" in m for m in messages)
+
+
 def test_experimental_function_bypassed_with_env_var(monkeypatch):
   """Experimental function emits no warning when bypass env var is true."""
   true_values = ["true", "True", "TRUE", "1", "yes", "YES", "on", "ON"]
@@ -272,6 +314,7 @@ def test_experimental_function_not_bypassed_for_false_env_var(monkeypatch):
   """Experimental function still warns for non-true bypass env var values."""
   false_values = ["false", "False", "FALSE", "0", "", "no", "off"]
   for false_val in false_values:
+    _WARNED_MESSAGES.clear()
     monkeypatch.setenv("ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", false_val)
     with warnings.catch_warnings(record=True) as w:
       warnings.simplefilter("always")
@@ -284,6 +327,7 @@ def test_experimental_class_not_bypassed_for_false_env_var(monkeypatch):
   """Experimental class still warns for non-true bypass env var values."""
   false_values = ["false", "False", "FALSE", "0", "", "no", "off"]
   for false_val in false_values:
+    _WARNED_MESSAGES.clear()
     monkeypatch.setenv("ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", false_val)
     with warnings.catch_warnings(record=True) as w:
       warnings.simplefilter("always")
@@ -292,8 +336,11 @@ def test_experimental_class_not_bypassed_for_false_env_var(monkeypatch):
       assert "[EXPERIMENTAL] ExperimentalClass:" in str(w[0].message)
 
 
-def test_experimental_class_no_parens_warns():
+def test_experimental_class_no_parens_warns(monkeypatch):
   """Test that experimental class without parentheses shows default warning."""
+  monkeypatch.delenv(
+      "ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", raising=False
+  )
   with warnings.catch_warnings(record=True) as w:
     warnings.simplefilter("always")
 
@@ -309,8 +356,11 @@ def test_experimental_class_no_parens_warns():
     )
 
 
-def test_experimental_class_empty_parens_warns():
+def test_experimental_class_empty_parens_warns(monkeypatch):
   """Test that experimental class with empty parentheses shows default warning."""
+  monkeypatch.delenv(
+      "ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", raising=False
+  )
   with warnings.catch_warnings(record=True) as w:
     warnings.simplefilter("always")
 
@@ -326,8 +376,11 @@ def test_experimental_class_empty_parens_warns():
     )
 
 
-def test_experimental_function_no_parens_warns():
+def test_experimental_function_no_parens_warns(monkeypatch):
   """Test that experimental function without parentheses shows default warning."""
+  monkeypatch.delenv(
+      "ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", raising=False
+  )
   with warnings.catch_warnings(record=True) as w:
     warnings.simplefilter("always")
 
@@ -342,8 +395,11 @@ def test_experimental_function_no_parens_warns():
     )
 
 
-def test_experimental_function_empty_parens_warns():
+def test_experimental_function_empty_parens_warns(monkeypatch):
   """Test that experimental function with empty parentheses shows default warning."""
+  monkeypatch.delenv(
+      "ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", raising=False
+  )
   with warnings.catch_warnings(record=True) as w:
     warnings.simplefilter("always")
 

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,45 +16,73 @@
 
 from __future__ import annotations
 
-import asyncio
-import copy
-import inspect
 import logging
-import threading
-from typing import Any
-from typing import AsyncGenerator
-from typing import cast
+from typing import Dict
 from typing import Optional
 from typing import TYPE_CHECKING
-import uuid
 
+from google.adk.platform import uuid as platform_uuid
 from google.genai import types
 
-from ...agents.active_streaming_tool import ActiveStreamingTool
-from ...agents.invocation_context import InvocationContext
+from . import _batch_tool_executor
+from ...auth.auth_tool import AuthConfig
 from ...auth.auth_tool import AuthToolArguments
 from ...events.event import Event
-from ...events.event_actions import EventActions
-from ...telemetry.tracing import trace_merged_tool_calls
-from ...telemetry.tracing import trace_tool_call
-from ...telemetry.tracing import tracer
 from ...tools.base_tool import BaseTool
 from ...tools.tool_confirmation import ToolConfirmation
-from ...tools.tool_context import ToolContext
-from ...utils.context_utils import Aclosing
+# Re-export definitions from submodules for full backward compatibility
+from ._batch_tool_executor import _execute_prepared_function_calls_async as _execute_prepared_function_calls_async
+from ._batch_tool_executor import _execute_prepared_function_calls_live as _execute_prepared_function_calls_live
+from ._batch_tool_executor import _gather_or_cancel as _gather_or_cancel
+from ._batch_tool_executor import _is_non_blocking_tool as _is_non_blocking_tool
+from ._batch_tool_executor import _launch_non_blocking_call_live as _launch_non_blocking_call_live
+from ._batch_tool_executor import _merge_and_trace_function_response_events as _merge_and_trace_function_response_events
+from ._batch_tool_executor import _prepare_function_calls as _prepare_function_calls
+from ._batch_tool_executor import deep_merge_dicts as deep_merge_dicts
+from ._batch_tool_executor import merge_parallel_function_response_events as merge_parallel_function_response_events
+from ._invocation_utils import require_agent_name as _require_agent_name
+from ._tool_caller import _as_callback_result as _as_callback_result
+from ._tool_caller import _as_function_response_part as _as_function_response_part
+from ._tool_caller import _build_function_response_content as _build_function_response_content
+from ._tool_caller import _build_response_event as _build_response_event
+from ._tool_caller import _call_tool_async as _call_tool_async
+from ._tool_caller import _call_tool_in_thread_pool as _call_tool_in_thread_pool
+from ._tool_caller import _create_tool_context as _create_tool_context
+from ._tool_caller import _emit_streaming_tool_event as _emit_streaming_tool_event
+from ._tool_caller import _execute_single_prepared_call as _execute_single_prepared_call
+from ._tool_caller import _execute_single_prepared_call_async as _execute_single_prepared_call_async
+from ._tool_caller import _execute_single_prepared_call_live as _execute_single_prepared_call_live
+from ._tool_caller import _extract_media_from_entry as _extract_media_from_entry
+from ._tool_caller import _extract_multimodal_parts as _extract_multimodal_parts
+from ._tool_caller import _get_tool as _get_tool
+from ._tool_caller import _get_tool_and_context as _get_tool_and_context
+from ._tool_caller import _get_tool_thread_pool as _get_tool_thread_pool
+from ._tool_caller import _is_live_request_queue_annotation as _is_live_request_queue_annotation
+from ._tool_caller import _is_sync_tool as _is_sync_tool
+from ._tool_caller import _MAX_MEDIA_CONTAINER_DEPTH as _MAX_MEDIA_CONTAINER_DEPTH
+from ._tool_caller import _message_content_for_user as _message_content_for_user
+from ._tool_caller import _MESSAGE_EVENT_FIELDS as _MESSAGE_EVENT_FIELDS
+from ._tool_caller import _normalize_tool_result as _normalize_tool_result
+from ._tool_caller import _prepare_single as _prepare_single
+from ._tool_caller import _PreparedFunctionCall as _PreparedFunctionCall
+from ._tool_caller import _process_function_live_helper as _process_function_live_helper
+from ._tool_caller import _TOOL_THREAD_POOL_LOCK as _TOOL_THREAD_POOL_LOCK
+from ._tool_caller import _TOOL_THREAD_POOLS as _TOOL_THREAD_POOLS
+from ._tool_caller import _try_decode_computer_use_image as _try_decode_computer_use_image
 
 if TYPE_CHECKING:
-  from ...agents.llm_agent import LlmAgent
+  from ...agents.invocation_context import InvocationContext
 
 AF_FUNCTION_CALL_ID_PREFIX = 'adk-'
 REQUEST_EUC_FUNCTION_CALL_NAME = 'adk_request_credential'
 REQUEST_CONFIRMATION_FUNCTION_CALL_NAME = 'adk_request_confirmation'
+REQUEST_INPUT_FUNCTION_CALL_NAME = 'adk_request_input'
 
 logger = logging.getLogger('google_adk.' + __name__)
 
 
 def generate_client_function_call_id() -> str:
-  return f'{AF_FUNCTION_CALL_ID_PREFIX}{uuid.uuid4()}'
+  return f'{AF_FUNCTION_CALL_ID_PREFIX}{platform_uuid.new_uuid()}'
 
 
 def populate_client_function_call_id(model_response_event: Event) -> None:
@@ -94,49 +122,101 @@ def get_long_running_function_calls(
     function_calls: list[types.FunctionCall],
     tools_dict: dict[str, BaseTool],
 ) -> set[str]:
-  long_running_tool_ids = set()
+  long_running_tool_ids: set[str] = set()
   for function_call in function_calls:
     if (
         function_call.name in tools_dict
         and tools_dict[function_call.name].is_long_running
+        and function_call.id is not None
     ):
       long_running_tool_ids.add(function_call.id)
 
   return long_running_tool_ids
 
 
-def generate_auth_event(
+def build_auth_request_event(
     invocation_context: InvocationContext,
-    function_response_event: Event,
-) -> Optional[Event]:
-  if not function_response_event.actions.requested_auth_configs:
-    return None
-  parts = []
-  long_running_tool_ids = set()
-  for (
-      function_call_id,
-      auth_config,
-  ) in function_response_event.actions.requested_auth_configs.items():
+    auth_requests: Dict[str, AuthConfig],
+    *,
+    author: Optional[str] = None,
+    role: Optional[str] = None,
+) -> Event:
+  """Builds an auth request event with function calls for each auth request.
 
+  This is a shared helper used by both tool-level auth (when a tool requests
+  auth during execution) and toolset-level auth (before tool listing).
+
+  Args:
+    invocation_context: The invocation context.
+    auth_requests: Dict mapping function_call_id to AuthConfig.
+    author: The event author. Defaults to agent name.
+    role: The content role. Defaults to None.
+
+  Returns:
+    Event with auth request function calls.
+  """
+  parts: list[types.Part] = []
+  long_running_tool_ids: set[str] = set()
+
+  deduplicated_requests: dict[str, AuthConfig] = {}
+  seen_keys = set()
+  for function_call_id, auth_config in auth_requests.items():
+    key = auth_config.credential_key
+    if not key:
+      deduplicated_requests[function_call_id] = auth_config
+    elif key not in seen_keys:
+      seen_keys.add(key)
+      deduplicated_requests[function_call_id] = auth_config
+
+  for function_call_id, auth_config in deduplicated_requests.items():
+    request_id = generate_client_function_call_id()
     request_euc_function_call = types.FunctionCall(
         name=REQUEST_EUC_FUNCTION_CALL_NAME,
+        id=request_id,
         args=AuthToolArguments(
             function_call_id=function_call_id,
             auth_config=auth_config,
-        ).model_dump(exclude_none=True, by_alias=True),
+        ).model_dump(mode='json', exclude_none=True, by_alias=True),
     )
-    request_euc_function_call.id = generate_client_function_call_id()
-    long_running_tool_ids.add(request_euc_function_call.id)
+    long_running_tool_ids.add(request_id)
     parts.append(types.Part(function_call=request_euc_function_call))
 
   return Event(
       invocation_id=invocation_context.invocation_id,
-      author=invocation_context.agent.name,
+      author=author or _require_agent_name(invocation_context),
       branch=invocation_context.branch,
-      content=types.Content(
-          parts=parts, role=function_response_event.content.role
-      ),
+      content=types.Content(parts=parts, role=role),
       long_running_tool_ids=long_running_tool_ids,
+  )
+
+
+def generate_auth_event(
+    invocation_context: InvocationContext,
+    function_response_event: Event,
+) -> Optional[Event]:
+  """Generates an auth request event from a function response event.
+
+  This is used for tool-level auth where a tool requests credentials during
+  execution.
+
+  Args:
+    invocation_context: The invocation context.
+    function_response_event: The function response event with auth requests.
+
+  Returns:
+    Event with auth request function calls, or None if no auth requested.
+  """
+  if not function_response_event.actions.requested_auth_configs:
+    return None
+
+  return build_auth_request_event(
+      invocation_context,
+      function_response_event.actions.requested_auth_configs,
+      role=(
+          function_response_event.content.role
+          if function_response_event.content is not None
+          else None
+      ),
   )
 
 
@@ -148,8 +228,8 @@ def generate_request_confirmation_event(
   """Generates a request confirmation event from a function response event."""
   if not function_response_event.actions.requested_tool_confirmations:
     return None
-  parts = []
-  long_running_tool_ids = set()
+  parts: list[types.Part] = []
+  long_running_tool_ids: set[str] = set()
   function_calls = function_call_event.get_function_calls()
   for (
       function_call_id,
@@ -160,8 +240,10 @@ def generate_request_confirmation_event(
     )
     if not original_function_call:
       continue
+    request_id = generate_client_function_call_id()
     request_confirmation_function_call = types.FunctionCall(
         name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
+        id=request_id,
         args={
             'originalFunctionCall': original_function_call.model_dump(
                 exclude_none=True, by_alias=True
@@ -171,18 +253,32 @@ def generate_request_confirmation_event(
             ),
         },
     )
-    request_confirmation_function_call.id = generate_client_function_call_id()
-    long_running_tool_ids.add(request_confirmation_function_call.id)
+    long_running_tool_ids.add(request_id)
     parts.append(types.Part(function_call=request_confirmation_function_call))
 
   return Event(
       invocation_id=invocation_context.invocation_id,
-      author=invocation_context.agent.name,
+      author=_require_agent_name(invocation_context),
       branch=invocation_context.branch,
-      content=types.Content(
-          parts=parts, role=function_response_event.content.role
-      ),
+      content=types.Content(parts=parts, role='model'),
       long_running_tool_ids=long_running_tool_ids,
+  )
+
+
+async def handle_function_call_list_async(
+    invocation_context: InvocationContext,
+    function_calls: list[types.FunctionCall],
+    tools_dict: dict[str, BaseTool],
+    filters: Optional[set[str]] = None,
+    tool_confirmation_dict: Optional[dict[str, ToolConfirmation]] = None,
+) -> Optional[Event]:
+  """Calls the functions and returns the function response event."""
+  return await _batch_tool_executor.handle_function_call_list_async(
+      invocation_context=invocation_context,
+      function_calls=function_calls,
+      tools_dict=tools_dict,
+      filters=filters,
+      tool_confirmation_dict=tool_confirmation_dict,
   )
 
 
@@ -204,672 +300,39 @@ async def handle_function_calls_async(
   )
 
 
-async def handle_function_call_list_async(
-    invocation_context: InvocationContext,
-    function_calls: list[types.FunctionCall],
-    tools_dict: dict[str, BaseTool],
-    filters: Optional[set[str]] = None,
-    tool_confirmation_dict: Optional[dict[str, ToolConfirmation]] = None,
-) -> Optional[Event]:
-  """Calls the functions and returns the function response event."""
-  from ...agents.llm_agent import LlmAgent
-
-  agent = invocation_context.agent
-
-  # Filter function calls
-  filtered_calls = [
-      fc for fc in function_calls if not filters or fc.id in filters
-  ]
-
-  if not filtered_calls:
-    return None
-
-  # Create tasks for parallel execution
-  tasks = [
-      asyncio.create_task(
-          _execute_single_function_call_async(
-              invocation_context,
-              function_call,
-              tools_dict,
-              agent,
-              tool_confirmation_dict[function_call.id]
-              if tool_confirmation_dict
-              else None,
-          )
-      )
-      for function_call in filtered_calls
-  ]
-
-  # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
-
-  # Filter out None results
-  function_response_events = [
-      event for event in function_response_events if event is not None
-  ]
-
-  if not function_response_events:
-    return None
-
-  merged_event = merge_parallel_function_response_events(
-      function_response_events
-  )
-
-  if len(function_response_events) > 1:
-    # this is needed for debug traces of parallel calls
-    # individual response with tool.name is traced in __build_response_event
-    # (we drop tool.name from span name here as this is merged event)
-    with tracer.start_as_current_span('execute_tool (merged)'):
-      trace_merged_tool_calls(
-          response_event_id=merged_event.id,
-          function_response_event=merged_event,
-      )
-  return merged_event
-
-
-async def _execute_single_function_call_async(
-    invocation_context: InvocationContext,
-    function_call: types.FunctionCall,
-    tools_dict: dict[str, BaseTool],
-    agent: LlmAgent,
-    tool_confirmation: Optional[ToolConfirmation] = None,
-) -> Optional[Event]:
-  """Execute a single function call with thread safety for state modifications."""
-
-  async def _run_on_tool_error_callbacks(
-      *,
-      tool: BaseTool,
-      tool_args: dict[str, Any],
-      tool_context: ToolContext,
-      error: Exception,
-  ) -> Optional[dict[str, Any]]:
-    """Runs the on_tool_error_callbacks for the given tool."""
-    error_response = (
-        await invocation_context.plugin_manager.run_on_tool_error_callback(
-            tool=tool,
-            tool_args=tool_args,
-            tool_context=tool_context,
-            error=error,
-        )
-    )
-    if error_response is not None:
-      return error_response
-
-    for callback in agent.canonical_on_tool_error_callbacks:
-      error_response = callback(
-          tool=tool,
-          args=tool_args,
-          tool_context=tool_context,
-          error=error,
-      )
-      if inspect.isawaitable(error_response):
-        error_response = await error_response
-      if error_response is not None:
-        return error_response
-
-    return None
-
-  # Do not use "args" as the variable name, because it is a reserved keyword
-  # in python debugger.
-  # Make a deep copy to avoid being modified.
-  function_args = (
-      copy.deepcopy(function_call.args) if function_call.args else {}
-  )
-
-  tool_context = _create_tool_context(
-      invocation_context, function_call, tool_confirmation
-  )
-
-  try:
-    tool = _get_tool(function_call, tools_dict)
-  except ValueError as tool_error:
-    tool = BaseTool(name=function_call.name, description='Tool not found')
-    error_response = await _run_on_tool_error_callbacks(
-        tool=tool,
-        tool_args=function_args,
-        tool_context=tool_context,
-        error=tool_error,
-    )
-    if error_response is not None:
-      return __build_response_event(
-          tool, error_response, tool_context, invocation_context
-      )
-    else:
-      raise tool_error
-
-  async def _run_with_trace():
-    nonlocal function_args
-
-    # Step 1: Check if plugin before_tool_callback overrides the function
-    # response.
-    function_response = (
-        await invocation_context.plugin_manager.run_before_tool_callback(
-            tool=tool, tool_args=function_args, tool_context=tool_context
-        )
-    )
-
-    # Step 2: If no overrides are provided from the plugins, further run the
-    # canonical callback.
-    if function_response is None:
-      for callback in agent.canonical_before_tool_callbacks:
-        function_response = callback(
-            tool=tool, args=function_args, tool_context=tool_context
-        )
-        if inspect.isawaitable(function_response):
-          function_response = await function_response
-        if function_response:
-          break
-
-    # Step 3: Otherwise, proceed calling the tool normally.
-    if function_response is None:
-      try:
-        function_response = await __call_tool_async(
-            tool, args=function_args, tool_context=tool_context
-        )
-      except Exception as tool_error:
-        error_response = await _run_on_tool_error_callbacks(
-            tool=tool,
-            tool_args=function_args,
-            tool_context=tool_context,
-            error=tool_error,
-        )
-        if error_response is not None:
-          function_response = error_response
-        else:
-          raise tool_error
-
-    # Step 4: Check if plugin after_tool_callback overrides the function
-    # response.
-    altered_function_response = (
-        await invocation_context.plugin_manager.run_after_tool_callback(
-            tool=tool,
-            tool_args=function_args,
-            tool_context=tool_context,
-            result=function_response,
-        )
-    )
-
-    # Step 5: If no overrides are provided from the plugins, further run the
-    # canonical after_tool_callbacks.
-    if altered_function_response is None:
-      for callback in agent.canonical_after_tool_callbacks:
-        altered_function_response = callback(
-            tool=tool,
-            args=function_args,
-            tool_context=tool_context,
-            tool_response=function_response,
-        )
-        if inspect.isawaitable(altered_function_response):
-          altered_function_response = await altered_function_response
-        if altered_function_response:
-          break
-
-    # Step 6: If alternative response exists from after_tool_callback, use it
-    # instead of the original function response.
-    if altered_function_response is not None:
-      function_response = altered_function_response
-
-    if tool.is_long_running:
-      # Allow long running function to return None to not provide function
-      # response.
-      if not function_response:
-        return None
-
-    # Note: State deltas are not applied here - they are collected in
-    # tool_context.actions.state_delta and applied later when the session
-    # service processes the events
-
-    # Builds the function response event.
-    function_response_event = __build_response_event(
-        tool, function_response, tool_context, invocation_context
-    )
-    return function_response_event
-
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
-    try:
-      function_response_event = await _run_with_trace()
-      trace_tool_call(
-          tool=tool,
-          args=function_args,
-          function_response_event=function_response_event,
-      )
-      return function_response_event
-    except:
-      trace_tool_call(
-          tool=tool, args=function_args, function_response_event=None
-      )
-      raise
-
-
 async def handle_function_calls_live(
     invocation_context: InvocationContext,
     function_call_event: Event,
     tools_dict: dict[str, BaseTool],
-) -> Event:
+) -> Event | None:
   """Calls the functions and returns the function response event."""
-  from ...agents.llm_agent import LlmAgent
-
-  agent = cast(LlmAgent, invocation_context.agent)
-  function_calls = function_call_event.get_function_calls()
-
-  if not function_calls:
-    return None
-
-  # Create async lock for active_streaming_tools modifications
-  streaming_lock = asyncio.Lock()
-
-  # Create tasks for parallel execution
-  tasks = [
-      asyncio.create_task(
-          _execute_single_function_call_live(
-              invocation_context,
-              function_call,
-              tools_dict,
-              agent,
-              streaming_lock,
-          )
-      )
-      for function_call in function_calls
-  ]
-
-  # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
-
-  # Filter out None results
-  function_response_events = [
-      event for event in function_response_events if event is not None
-  ]
-
-  if not function_response_events:
-    return None
-
-  merged_event = merge_parallel_function_response_events(
-      function_response_events
-  )
-  if len(function_response_events) > 1:
-    # this is needed for debug traces of parallel calls
-    # individual response with tool.name is traced in __build_response_event
-    # (we drop tool.name from span name here as this is merged event)
-    with tracer.start_as_current_span('execute_tool (merged)'):
-      trace_merged_tool_calls(
-          response_event_id=merged_event.id,
-          function_response_event=merged_event,
-      )
-  return merged_event
-
-
-async def _execute_single_function_call_live(
-    invocation_context: InvocationContext,
-    function_call: types.FunctionCall,
-    tools_dict: dict[str, BaseTool],
-    agent: LlmAgent,
-    streaming_lock: asyncio.Lock,
-) -> Optional[Event]:
-  """Execute a single function call for live mode with thread safety."""
-  tool, tool_context = _get_tool_and_context(
-      invocation_context, function_call, tools_dict
-  )
-
-  function_args = (
-      copy.deepcopy(function_call.args) if function_call.args else {}
-  )
-
-  async def _run_with_trace():
-    nonlocal function_args
-
-    # Do not use "args" as the variable name, because it is a reserved keyword
-    # in python debugger.
-    # Make a deep copy to avoid being modified.
-    function_response = None
-
-    # Handle before_tool_callbacks - iterate through the canonical callback
-    # list
-    for callback in agent.canonical_before_tool_callbacks:
-      function_response = callback(
-          tool=tool, args=function_args, tool_context=tool_context
-      )
-      if inspect.isawaitable(function_response):
-        function_response = await function_response
-      if function_response:
-        break
-
-    if function_response is None:
-      function_response = await _process_function_live_helper(
-          tool,
-          tool_context,
-          function_call,
-          function_args,
-          invocation_context,
-          streaming_lock,
-      )
-
-    # Calls after_tool_callback if it exists.
-    altered_function_response = None
-    for callback in agent.canonical_after_tool_callbacks:
-      altered_function_response = callback(
-          tool=tool,
-          args=function_args,
-          tool_context=tool_context,
-          tool_response=function_response,
-      )
-      if inspect.isawaitable(altered_function_response):
-        altered_function_response = await altered_function_response
-      if altered_function_response:
-        break
-
-    if altered_function_response is not None:
-      function_response = altered_function_response
-
-    if tool.is_long_running:
-      # Allow async function to return None to not provide function response.
-      if not function_response:
-        return None
-
-    # Note: State deltas are not applied here - they are collected in
-    # tool_context.actions.state_delta and applied later when the session
-    # service processes the events
-
-    # Builds the function response event.
-    function_response_event = __build_response_event(
-        tool, function_response, tool_context, invocation_context
-    )
-    return function_response_event
-
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
-    try:
-      function_response_event = await _run_with_trace()
-      trace_tool_call(
-          tool=tool,
-          args=function_args,
-          function_response_event=function_response_event,
-      )
-      return function_response_event
-    except:
-      trace_tool_call(
-          tool=tool, args=function_args, function_response_event=None
-      )
-      raise
-
-
-async def _process_function_live_helper(
-    tool,
-    tool_context,
-    function_call,
-    function_args,
-    invocation_context,
-    streaming_lock: asyncio.Lock,
-):
-  function_response = None
-  # Check if this is a stop_streaming function call
-  if (
-      function_call.name == 'stop_streaming'
-      and 'function_name' in function_args
-  ):
-    function_name = function_args['function_name']
-    # Thread-safe access to active_streaming_tools
-    async with streaming_lock:
-      active_tasks = invocation_context.active_streaming_tools
-      if (
-          active_tasks
-          and function_name in active_tasks
-          and active_tasks[function_name].task
-          and not active_tasks[function_name].task.done()
-      ):
-        task = active_tasks[function_name].task
-      else:
-        task = None
-
-    if task:
-      task.cancel()
-      try:
-        # Wait for the task to be cancelled
-        await asyncio.wait_for(task, timeout=1.0)
-      except (asyncio.CancelledError, asyncio.TimeoutError):
-        # Log the specific condition
-        if task.cancelled():
-          logging.info('Task %s was cancelled successfully', function_name)
-        elif task.done():
-          logging.info('Task %s completed during cancellation', function_name)
-        else:
-          logging.warning(
-              'Task %s might still be running after cancellation timeout',
-              function_name,
-          )
-          function_response = {
-              'status': f'The task is not cancelled yet for {function_name}.'
-          }
-      if not function_response:
-        # Clean up the reference under lock
-        async with streaming_lock:
-          if (
-              invocation_context.active_streaming_tools
-              and function_name in invocation_context.active_streaming_tools
-          ):
-            invocation_context.active_streaming_tools[function_name].task = None
-
-        function_response = {
-            'status': f'Successfully stopped streaming function {function_name}'
-        }
-    else:
-      function_response = {
-          'status': f'No active streaming function named {function_name} found'
-      }
-  elif hasattr(tool, 'func') and inspect.isasyncgenfunction(tool.func):
-    # for streaming tool use case
-    # we require the function to be an async generator function
-    async def run_tool_and_update_queue(tool, function_args, tool_context):
-      try:
-        async with Aclosing(
-            __call_tool_live(
-                tool=tool,
-                args=function_args,
-                tool_context=tool_context,
-                invocation_context=invocation_context,
-            )
-        ) as agen:
-          async for result in agen:
-            updated_content = types.Content(
-                role='user',
-                parts=[
-                    types.Part.from_text(
-                        text=f'Function {tool.name} returned: {result}'
-                    )
-                ],
-            )
-            invocation_context.live_request_queue.send_content(updated_content)
-      except asyncio.CancelledError:
-        raise  # Re-raise to properly propagate the cancellation
-
-    task = asyncio.create_task(
-        run_tool_and_update_queue(tool, function_args, tool_context)
-    )
-
-    # Register streaming tool using original logic
-    async with streaming_lock:
-      if invocation_context.active_streaming_tools is None:
-        invocation_context.active_streaming_tools = {}
-
-      if tool.name in invocation_context.active_streaming_tools:
-        invocation_context.active_streaming_tools[tool.name].task = task
-      else:
-        invocation_context.active_streaming_tools[tool.name] = (
-            ActiveStreamingTool(task=task)
-        )
-
-    # Immediately return a pending response.
-    # This is required by current live model.
-    function_response = {
-        'status': (
-            'The function is running asynchronously and the results are'
-            ' pending.'
-        )
-    }
-  else:
-    function_response = await __call_tool_async(
-        tool, args=function_args, tool_context=tool_context
-    )
-  return function_response
-
-
-def _get_tool(
-    function_call: types.FunctionCall, tools_dict: dict[str, BaseTool]
-):
-  """Returns the tool corresponding to the function call."""
-  if function_call.name not in tools_dict:
-    available = list(tools_dict.keys())
-    error_msg = (
-        f"Tool '{function_call.name}' not found.\nAvailable tools:"
-        f" {', '.join(available)}\n\nPossible causes:\n  1. LLM hallucinated"
-        ' the function name - review agent instruction clarity\n  2. Tool not'
-        ' registered - verify agent.tools list\n  3. Name mismatch - check for'
-        ' typos\n\nSuggested fixes:\n  - Review agent instruction to ensure'
-        ' tool usage is clear\n  - Verify tool is included in agent.tools'
-        ' list\n  - Check for typos in function name'
-    )
-    raise ValueError(error_msg)
-
-  return tools_dict[function_call.name]
-
-
-def _create_tool_context(
-    invocation_context: InvocationContext,
-    function_call: types.FunctionCall,
-    tool_confirmation: Optional[ToolConfirmation] = None,
-):
-  """Creates a ToolContext object."""
-  return ToolContext(
+  return await _batch_tool_executor.handle_function_calls_live(
       invocation_context=invocation_context,
-      function_call_id=function_call.id,
-      tool_confirmation=tool_confirmation,
+      function_call_event=function_call_event,
+      tools_dict=tools_dict,
   )
 
 
-def _get_tool_and_context(
-    invocation_context: InvocationContext,
-    function_call: types.FunctionCall,
-    tools_dict: dict[str, BaseTool],
-    tool_confirmation: Optional[ToolConfirmation] = None,
-):
-  """Returns the tool and tool context corresponding to the function call."""
-  tool = _get_tool(function_call, tools_dict)
-  tool_context = _create_tool_context(
-      invocation_context,
-      function_call,
-      tool_confirmation,
-  )
-
-  return (tool, tool_context)
+def find_event_by_function_call_id(
+    events: list[Event],
+    function_call_id: str,
+) -> Optional[Event]:
+  """Finds the function call event that matches the function call id."""
+  for event in reversed(events):
+    for function_call in event.get_function_calls():
+      if function_call.id == function_call_id:
+        return event
+  return None
 
 
-async def __call_tool_live(
-    tool: BaseTool,
-    args: dict[str, object],
-    tool_context: ToolContext,
-    invocation_context: InvocationContext,
-) -> AsyncGenerator[Event, None]:
-  """Calls the tool asynchronously (awaiting the coroutine)."""
-  async with Aclosing(
-      tool._call_live(
-          args=args,
-          tool_context=tool_context,
-          invocation_context=invocation_context,
-      )
-  ) as agen:
-    async for item in agen:
-      yield item
-
-
-async def __call_tool_async(
-    tool: BaseTool,
-    args: dict[str, Any],
-    tool_context: ToolContext,
-) -> Any:
-  """Calls the tool."""
-  return await tool.run_async(args=args, tool_context=tool_context)
-
-
-def __build_response_event(
-    tool: BaseTool,
-    function_result: dict[str, object],
-    tool_context: ToolContext,
-    invocation_context: InvocationContext,
-) -> Event:
-  # Specs requires the result to be a dict.
-  if not isinstance(function_result, dict):
-    function_result = {'result': function_result}
-
-  part_function_response = types.Part.from_function_response(
-      name=tool.name, response=function_result
-  )
-  part_function_response.function_response.id = tool_context.function_call_id
-
-  content = types.Content(
-      role='user',
-      parts=[part_function_response],
-  )
-
-  function_response_event = Event(
-      invocation_id=invocation_context.invocation_id,
-      author=invocation_context.agent.name,
-      content=content,
-      actions=tool_context.actions,
-      branch=invocation_context.branch,
-  )
-
-  return function_response_event
-
-
-def deep_merge_dicts(d1: dict, d2: dict) -> dict:
-  """Recursively merges d2 into d1."""
-  for key, value in d2.items():
-    if key in d1 and isinstance(d1[key], dict) and isinstance(value, dict):
-      d1[key] = deep_merge_dicts(d1[key], value)
-    else:
-      d1[key] = value
-  return d1
-
-
-def merge_parallel_function_response_events(
-    function_response_events: list['Event'],
-) -> 'Event':
-  if not function_response_events:
-    raise ValueError('No function response events provided.')
-
-  if len(function_response_events) == 1:
-    return function_response_events[0]
-  merged_parts = []
-  for event in function_response_events:
-    if event.content:
-      for part in event.content.parts or []:
-        merged_parts.append(part)
-
-  # Use the first event as the "base" for common attributes
-  base_event = function_response_events[0]
-
-  # Merge actions from all events
-  merged_actions_data: dict[str, Any] = {}
-  for event in function_response_events:
-    if event.actions:
-      # Use `by_alias=True` because it converts the model to a dictionary while respecting field aliases, ensuring that the enum fields are correctly handled without creating a duplicate.
-      merged_actions_data = deep_merge_dicts(
-          merged_actions_data,
-          event.actions.model_dump(exclude_none=True, by_alias=True),
-      )
-
-  merged_actions = EventActions.model_validate(merged_actions_data)
-
-  # Create the new merged event
-  merged_event = Event(
-      invocation_id=base_event.invocation_id,
-      author=base_event.author,
-      branch=base_event.branch,
-      content=types.Content(role='user', parts=merged_parts),
-      actions=merged_actions,  # Optionally merge actions if required
-  )
-
-  # Use the base_event as the timestamp
-  merged_event.timestamp = base_event.timestamp
-  return merged_event
+def _collect_function_call_ids(events: list[Event]) -> set[str]:
+  """Returns the ids of every function call recorded in ``events``."""
+  call_ids: set[str] = set()
+  for event in events:
+    for function_call in event.get_function_calls():
+      if function_call.id:
+        call_ids.add(function_call.id)
+  return call_ids
 
 
 def find_matching_function_call(
@@ -880,25 +343,11 @@ def find_matching_function_call(
     return None
 
   last_event = events[-1]
-  if (
-      last_event.content
-      and last_event.content.parts
-      and any(part.function_response for part in last_event.content.parts)
-  ):
+  function_responses = last_event.get_function_responses()
+  if not function_responses:
+    return None
 
-    function_call_id = next(
-        part.function_response.id
-        for part in last_event.content.parts
-        if part.function_response
-    )
-    for i in range(len(events) - 2, -1, -1):
-      event = events[i]
-      # looking for the system long running request euc function call
-      function_calls = event.get_function_calls()
-      if not function_calls:
-        continue
-
-      for function_call in function_calls:
-        if function_call.id == function_call_id:
-          return event
-  return None
+  function_call_id = function_responses[0].id
+  if function_call_id is None:
+    return None
+  return find_event_by_function_call_id(events[:-1], function_call_id)

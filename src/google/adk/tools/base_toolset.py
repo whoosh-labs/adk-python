@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
 import copy
+from typing import Callable
 from typing import final
 from typing import List
 from typing import Optional
@@ -27,7 +28,10 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 
+from google.genai import types
+
 from ..agents.readonly_context import ReadonlyContext
+from ..auth.auth_tool import AuthConfig
 from .base_tool import BaseTool
 
 if TYPE_CHECKING:
@@ -79,6 +83,9 @@ class BaseToolset(ABC):
     """
     self.tool_filter = tool_filter
     self.tool_name_prefix = tool_name_prefix
+    self._cached_invocation_id: Optional[str] = None
+    self._cached_prefixed_tools: Optional[list[BaseTool]] = None
+    self._use_invocation_cache = True
 
   @abstractmethod
   async def get_tools(
@@ -86,6 +93,22 @@ class BaseToolset(ABC):
       readonly_context: Optional[ReadonlyContext] = None,
   ) -> list[BaseTool]:
     """Return all tools in the toolset based on the provided context.
+
+    A toolset that must stay usable when listing fails handles that here. The
+    framework isolates a raised exception by dropping the whole toolset from the
+    agent, so override this method to catch it and contribute placeholder tools
+    instead. Replacement tools returned directly from the error branch bypass
+    tool_filter. The exception type is toolset-specific, so catch whatever the
+    base toolset actually raises. For example, to prompt the user to authorize an
+    MCP server that answered HTTP 401:
+
+        class OAuthPromptingMcpToolset(McpToolset):
+
+          async def get_tools(self, readonly_context=None):
+            try:
+              return await super().get_tools(readonly_context)
+            except ConnectionError as e:
+              return [ConnectMcpServerTool(e)]
 
     Args:
       readonly_context (ReadonlyContext, optional): Context used to filter tools
@@ -111,9 +134,20 @@ class BaseToolset(ABC):
     Returns:
       list[BaseTool]: A list of tools with prefixed names if tool_name_prefix is provided.
     """
+    invocation_id = readonly_context.invocation_id if readonly_context else None
+
+    if (
+        self._use_invocation_cache
+        and self._cached_prefixed_tools is not None
+        and self._cached_invocation_id == invocation_id
+    ):
+      return self._cached_prefixed_tools
+
     tools = await self.get_tools(readonly_context)
 
     if not self.tool_name_prefix:
+      self._cached_invocation_id = invocation_id
+      self._cached_prefixed_tools = tools
       return tools
 
     prefix = self.tool_name_prefix
@@ -131,10 +165,12 @@ class BaseToolset(ABC):
       # Also update the function declaration name if the tool has one
       # Use default parameters to capture the current values in the closure
       def _create_prefixed_declaration(
-          original_get_declaration=tool._get_declaration,
-          prefixed_name=prefixed_name,
-      ):
-        def _get_prefixed_declaration():
+          original_get_declaration: Callable[
+              [], Optional[types.FunctionDeclaration]
+          ] = tool._get_declaration,
+          prefixed_name: str = prefixed_name,
+      ) -> Callable[[], Optional[types.FunctionDeclaration]]:
+        def _get_prefixed_declaration() -> Optional[types.FunctionDeclaration]:
           declaration = original_get_declaration()
           if declaration is not None:
             declaration.name = prefixed_name
@@ -143,9 +179,13 @@ class BaseToolset(ABC):
 
         return _get_prefixed_declaration
 
-      tool_copy._get_declaration = _create_prefixed_declaration()
+      tool_copy._get_declaration = (  # type: ignore[method-assign]
+          _create_prefixed_declaration()
+      )
       prefixed_tools.append(tool_copy)
 
+    self._cached_invocation_id = invocation_id
+    self._cached_prefixed_tools = prefixed_tools
     return prefixed_tools
 
   async def close(self) -> None:
@@ -175,7 +215,7 @@ class BaseToolset(ABC):
     raise ValueError(f"from_config() not implemented for toolset: {cls}")
 
   def _is_tool_selected(
-      self, tool: BaseTool, readonly_context: ReadonlyContext
+      self, tool: BaseTool, readonly_context: Optional[ReadonlyContext]
   ) -> bool:
     if not self.tool_filter:
       return True
@@ -204,3 +244,21 @@ class BaseToolset(ABC):
       llm_request: The outgoing LLM request, mutable this method.
     """
     pass
+
+  def get_auth_config(self) -> Optional[AuthConfig]:
+    """Returns the auth config for this toolset. ADK will make sure the
+    'exchanged_auth_credential' field in the config is populated with
+    ready-to-use credential (e.g. oauth token for OAuth flow) before calling
+    get_tools method or execute any tools returned by this toolset. Thus toolset
+    can use this credential either for tool listing or tool calling. If tool
+    calling needs a different credential from ADK client, call
+    tool_context.request_credential in the tool.
+
+    Toolsets that support authentication should override this method to return
+    an AuthConfig constructed from their auth_scheme, auth_credential, and
+    optional credential_key parameters.
+
+    Returns:
+      AuthConfig if the toolset has authentication configured, None otherwise.
+    """
+    return None

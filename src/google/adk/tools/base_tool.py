@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from collections.abc import Callable as CallableABC
 import inspect
 import logging
 from typing import Any
@@ -33,7 +34,6 @@ from pydantic import BaseModel
 
 from ..utils.variant_utils import get_google_llm_variant
 from ..utils.variant_utils import GoogleLLMVariant
-from .tool_context import ToolContext
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -41,7 +41,17 @@ if TYPE_CHECKING:
   from ..models.llm_request import LlmRequest
   from .tool_configs import ToolArgsConfig
 
+# Re-exported for backward compatibility: existing code imports ToolContext
+# from this module and annotates tool methods with base_tool.ToolContext, which
+# ADK resolves at runtime via get_type_hints(), so it must be importable here.
+from .tool_context import ToolContext  # pylint: disable=unused-import
+
 SelfTool = TypeVar("SelfTool", bound="BaseTool")
+
+
+def _is_callable_annotation(annotation: object) -> bool:
+  """Returns whether a resolved annotation describes a callable."""
+  return annotation is Callable or get_origin(annotation) is CallableABC
 
 
 class BaseTool(ABC):
@@ -56,6 +66,27 @@ class BaseTool(ABC):
   """Whether the tool is a long running operation, which typically returns a
   resource id first and finishes the operation later."""
 
+  _defers_response: bool = False
+  """⚠️ Internal — do not set this from external code.
+
+  When True, the auto FunctionResponse build is skipped whenever
+  ``run_async`` returns a falsy value (typically ``None``).  In that
+  case, some other orchestrator (e.g., the LlmAgent wrapper for task
+  delegation, or an external system for webhook-style callbacks)
+  produces the matching FR later in the conversation.
+
+  When ``run_async`` returns a non-falsy value, the FR is built
+  normally — same as for any regular tool.
+
+  Compare with ``is_long_running``, which has the same skip-on-empty
+  semantics but additionally marks the call as long-running on the
+  emitted event (``event.long_running_tool_ids``), affecting A2A
+  conversion, plugin logging, and interrupt tracking.
+
+  Currently set only by ADK-internal tools (e.g. ``_TaskAgentTool``).
+  Not part of the public API and may change without notice.
+  """
+
   custom_metadata: Optional[dict[str, Any]] = None
   """The custom metadata of the BaseTool.
 
@@ -65,18 +96,38 @@ class BaseTool(ABC):
   NOTE: the entire dict must be JSON serializable.
   """
 
+  response_scheduling: Optional[types.FunctionResponseScheduling] = None
+  """Controls when the model reacts to the tool's response (Live API only).
+
+  Applied to the emitted ``FunctionResponse`` for asynchronous function calling:
+    - ``SILENT``: feeds the response back without triggering a model turn.
+    - ``WHEN_IDLE``: defers the reaction until the model is idle.
+    - ``INTERRUPT``: reacts immediately.
+
+  This is the tool-wide default. A streaming tool can choose a different mode
+  for one chunk by yielding a ``types.FunctionResponse`` carrying that chunk's
+  payload in ``response`` and the mode in ``scheduling``; anything it yields
+  plainly falls back to this setting.
+
+  Ignored by models that don't support asynchronous function calling. ``None``
+  preserves the default behavior.
+  """
+
   def __init__(
       self,
       *,
-      name,
-      description,
+      name: str,
+      description: str,
       is_long_running: bool = False,
       custom_metadata: Optional[dict[str, Any]] = None,
+      response_scheduling: Optional[types.FunctionResponseScheduling] = None,
   ):
     self.name = name
     self.description = description
     self.is_long_running = is_long_running
+    self._defers_response = False
     self.custom_metadata = custom_metadata
+    self.response_scheduling = response_scheduling
 
   def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
     """Gets the OpenAPI specification of this tool in the form of a FunctionDeclaration.
@@ -127,6 +178,12 @@ class BaseTool(ABC):
     """
     # Use the consolidated logic in LlmRequest.append_tools
     llm_request.append_tools([self])
+
+  async def check_require_confirmation(
+      self, args: dict[str, Any], tool_context: ToolContext
+  ) -> bool:
+    """Returns whether the tool requires confirmation for the given args."""
+    return False
 
   @property
   def _api_variant(self) -> GoogleLLMVariant:
@@ -184,7 +241,7 @@ class BaseTool(ABC):
             and value is not None
         ):
           kwargs[param_name] = param_type.model_validate(value)
-        elif param_type is Callable or get_origin(param_type) is Callable:
+        elif _is_callable_annotation(param_type):
           kwargs[param_name] = config_agent_utils.resolve_fully_qualified_name(
               value
           )
@@ -192,13 +249,15 @@ class BaseTool(ABC):
           kwargs[param_name] = param_type(value)
         elif get_origin(param_type) is list:
           list_args = get_args(param_type)
-          if issubclass(list_args[0], BaseModel):
+          if inspect.isclass(list_args[0]) and issubclass(
+              list_args[0], BaseModel
+          ):
             kwargs[param_name] = [
                 list_args[0].model_validate(item) for item in value
             ]
           elif list_args[0] in (int, str, bool, float):
             kwargs[param_name] = value
-          elif list_args[0] is Callable or get_origin(list_args[0]) is Callable:
+          elif _is_callable_annotation(list_args[0]):
             kwargs[param_name] = [
                 config_agent_utils.resolve_fully_qualified_name(item)
                 for item in value

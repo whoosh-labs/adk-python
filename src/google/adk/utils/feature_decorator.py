@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,39 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import functools
 import os
-from typing import Callable
+from typing import Any
 from typing import cast
 from typing import Optional
+from typing import overload
+from typing import Protocol
 from typing import TypeVar
-from typing import Union
 import warnings
 
-T = TypeVar("T", bound=Union[Callable, type])
+T = TypeVar("T")
+
+
+class _FeatureDecorator(Protocol):
+  """A feature decorator usable with or without a message argument.
+
+  Preserves the decorated object's type so that subclasses and type
+  checkers continue to see the real class/function rather than ``Any``.
+  """
+
+  # @decorator (bare, on a class or function)
+  @overload
+  def __call__(self, message_or_obj: T) -> T:
+    ...
+
+  # @decorator() or @decorator("message")
+  @overload
+  def __call__(self, message_or_obj: Optional[str] = ...) -> Callable[[T], T]:
+    ...
+
+  def __call__(self, message_or_obj: Any = None) -> Any:
+    ...
 
 
 def _is_truthy_env(var_name: str) -> bool:
@@ -33,14 +56,27 @@ def _is_truthy_env(var_name: str) -> bool:
   return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Repeating an unchanging notice buries warnings the user can act on, and the
+# interpreter's own per-location deduplication is discarded whenever anything
+# in the process touches the warning filters.
+_WARNED_MESSAGES: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+  if msg in _WARNED_MESSAGES:
+    return
+  _WARNED_MESSAGES.add(msg)
+  warnings.warn(msg, category=UserWarning, stacklevel=3)
+
+
 def _make_feature_decorator(
     *,
     label: str,
     default_message: str,
     block_usage: bool = False,
     bypass_env_var: Optional[str] = None,
-) -> Callable:
-  def decorator_factory(message_or_obj=None):
+) -> _FeatureDecorator:
+  def decorator_factory(message_or_obj: Any = None) -> Any:
     # Case 1: Used as @decorator without parentheses
     # message_or_obj is the decorated class/function
     if message_or_obj is not None and (
@@ -57,7 +93,7 @@ def _make_feature_decorator(
     )
     return _create_decorator(message, label, block_usage, bypass_env_var)
 
-  return decorator_factory
+  return cast(_FeatureDecorator, decorator_factory)
 
 
 def _create_decorator(
@@ -68,10 +104,11 @@ def _create_decorator(
     msg = f"[{label.upper()}] {obj_name}: {message}"
 
     if isinstance(obj, type):  # decorating a class
-      orig_init = obj.__init__
+      cls = cast(type[Any], obj)
+      orig_init = cast(Any, cls).__init__
 
       @functools.wraps(orig_init)
-      def new_init(self, *args, **kwargs):
+      def new_init(self: Any, *args: Any, **kwargs: Any) -> Any:
         # Check if usage should be bypassed via environment variable at call time
         should_bypass = bypass_env_var is not None and _is_truthy_env(
             bypass_env_var
@@ -83,16 +120,17 @@ def _create_decorator(
         elif block_usage:
           raise RuntimeError(msg)
         else:
-          warnings.warn(msg, category=UserWarning, stacklevel=2)
+          _warn_once(msg)
         return orig_init(self, *args, **kwargs)
 
-      obj.__init__ = new_init  # type: ignore[attr-defined]
-      return cast(T, obj)
+      cast(Any, cls).__init__ = new_init
+      return cast(T, cls)
 
     elif callable(obj):  # decorating a function or method
+      func = cast(Callable[..., Any], obj)
 
-      @functools.wraps(obj)
-      def wrapper(*args, **kwargs):
+      @functools.wraps(func)
+      def wrapper(*args: Any, **kwargs: Any) -> Any:
         # Check if usage should be bypassed via environment variable at call time
         should_bypass = bypass_env_var is not None and _is_truthy_env(
             bypass_env_var
@@ -104,8 +142,8 @@ def _create_decorator(
         elif block_usage:
           raise RuntimeError(msg)
         else:
-          warnings.warn(msg, category=UserWarning, stacklevel=2)
-        return obj(*args, **kwargs)
+          _warn_once(msg)
+        return func(*args, **kwargs)
 
       return cast(T, wrapper)
 

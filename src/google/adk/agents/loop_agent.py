@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,27 +17,38 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 from typing import AsyncGenerator
 from typing import ClassVar
-from typing import Dict
 from typing import Optional
+import warnings
 
+from typing_extensions import deprecated
 from typing_extensions import override
 
 from ..events.event import Event
+from ..features import experimental
+from ..features import FeatureName
 from ..utils.context_utils import Aclosing
-from ..utils.feature_decorator import experimental
 from .base_agent import BaseAgent
 from .base_agent import BaseAgentState
 from .base_agent_config import BaseAgentConfig
 from .invocation_context import InvocationContext
-from .loop_agent_config import LoopAgentConfig
+
+with warnings.catch_warnings():
+  # LoopAgentConfig subclasses the deprecated BaseAgentConfig purely as an
+  # internal implementation detail, so this import alone should not warn
+  # applications that never touch the deprecated Agent Config APIs.
+  warnings.filterwarnings(
+      'ignore',
+      message=r'.*BaseAgentConfig is deprecated.*',
+      category=DeprecationWarning,
+  )
+  from .loop_agent_config import LoopAgentConfig
 
 logger = logging.getLogger('google_adk.' + __name__)
 
 
-@experimental
+@experimental(FeatureName.AGENT_STATE)
 class LoopAgentState(BaseAgentState):
   """State for LoopAgent."""
 
@@ -48,21 +59,33 @@ class LoopAgentState(BaseAgentState):
   """The number of times the loop agent has looped."""
 
 
+@deprecated(
+    'LoopAgent is deprecated in favor of Workflow and will be removed in a'
+    ' future version. Workflow cannot yet be used as an LlmAgent sub-agent.'
+)
 class LoopAgent(BaseAgent):
   """A shell agent that run its sub-agents in a loop.
 
   When sub-agent generates an event with escalate or max_iterations are
   reached, the loop agent will stop.
+
+  .. deprecated::
+    LoopAgent is deprecated in favor of Workflow and will be removed in a
+    future version. Workflow cannot yet be used as an LlmAgent sub-agent.
   """
 
   config_type: ClassVar[type[BaseAgentConfig]] = LoopAgentConfig
-  """The config type for this agent."""
+  """The config type for this agent.
+
+  DEPRECATED: This attribute is deprecated and will be removed in a future
+  version, along with the AgentConfig YAML loader.
+  """
 
   max_iterations: Optional[int] = None
   """The maximum number of iterations to run the loop agent.
 
   If not set, the loop agent will run indefinitely until a sub-agent
-  escalates.
+  escalates. A value of zero or less runs the sub-agents no times at all.
   """
 
   @override
@@ -79,7 +102,7 @@ class LoopAgent(BaseAgent):
     should_exit = False
     pause_invocation = False
     while (
-        not self.max_iterations or times_looped < self.max_iterations
+        self.max_iterations is None or times_looped < self.max_iterations
     ) and not (should_exit or pause_invocation):
       for i in range(start_index, len(self.sub_agents)):
         sub_agent = self.sub_agents[i]
@@ -107,11 +130,12 @@ class LoopAgent(BaseAgent):
         if should_exit or pause_invocation:
           break  # break inner for loop
 
-      # Restart from the beginning of the loop.
-      start_index = 0
-      times_looped += 1
-      # Reset the state of all sub-agents in the loop.
-      ctx.reset_sub_agent_states(self.name)
+      if not pause_invocation:
+        # Restart from the beginning of the loop.
+        start_index = 0
+        times_looped += 1
+        # Reset the state of all sub-agents in the loop.
+        ctx.reset_sub_agent_states(self.name)
 
     # If the invocation is paused, we should not yield the end of agent event.
     if pause_invocation:
@@ -150,16 +174,3 @@ class LoopAgent(BaseAgent):
   ) -> AsyncGenerator[Event, None]:
     raise NotImplementedError('This is not supported yet for LoopAgent.')
     yield  # AsyncGenerator requires having at least one yield statement
-
-  @override
-  @classmethod
-  @experimental
-  def _parse_config(
-      cls: type[LoopAgent],
-      config: LoopAgentConfig,
-      config_abs_path: str,
-      kwargs: Dict[str, Any],
-  ) -> Dict[str, Any]:
-    if config.max_iterations:
-      kwargs['max_iterations'] = config.max_iterations
-    return kwargs

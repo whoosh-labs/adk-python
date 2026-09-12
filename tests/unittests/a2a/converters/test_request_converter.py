@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,32 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 from unittest.mock import Mock
-from unittest.mock import patch
 
+from a2a.server.agent_execution import RequestContext
+from google.adk.a2a import _compat
+from google.adk.a2a.converters.request_converter import _get_user_id
+from google.adk.a2a.converters.request_converter import convert_a2a_request_to_agent_run_request
+from google.adk.runners import RunConfig
+from google.genai import types as genai_types
 import pytest
-
-# Skip all tests in this module if Python version is less than 3.10
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 10), reason="A2A requires Python 3.10+"
-)
-
-# Import dependencies with version checking
-try:
-  from a2a.server.agent_execution import RequestContext
-  from google.adk.a2a.converters.request_converter import _get_user_id
-  from google.adk.a2a.converters.request_converter import convert_a2a_request_to_agent_run_request
-  from google.adk.runners import RunConfig
-  from google.genai import types as genai_types
-except ImportError as e:
-  if sys.version_info < (3, 10):
-    # Imports are not needed since tests will be skipped due to pytestmark.
-    # The imported names are only used within test methods, not at module level,
-    # so no NameError occurs during module compilation.
-    pass
-  else:
-    raise e
 
 
 class TestGetUserId:
@@ -246,6 +229,54 @@ class TestConvertA2aRequestToAgentRunRequest:
     assert mock_convert_part.call_count == 2
     mock_convert_part.assert_any_call(mock_part1)
     mock_convert_part.assert_any_call(mock_part2)
+
+  def test_convert_a2a_request_normalizes_proto_struct_metadata(self):
+    """Request metadata is normalized to a plain dict across SDK versions."""
+    # Build metadata in the native shape of the active SDK (proto Struct on 1.x,
+    # plain dict on 0.3.x) by writing onto a real a2a Message.
+    message_with_meta = _compat.make_message(
+        message_id="m1", role=_compat.ROLE_USER, parts=[]
+    )
+    _compat.set_struct_metadata(
+        message_with_meta, {"test_key": "test_value", "n": 1}
+    )
+
+    mock_message = Mock()
+    mock_message.parts = []
+
+    request = Mock(spec=RequestContext)
+    request.message = mock_message
+    request.context_id = "ctx"
+    request.call_context = None
+    request.metadata = message_with_meta.metadata
+
+    result = convert_a2a_request_to_agent_run_request(request, Mock())
+
+    stored = result.run_config.custom_metadata["a2a_metadata"]
+    # Must be a plain dict (not a proto Struct) regardless of SDK version.
+    assert isinstance(stored, dict)
+    assert stored["test_key"] == "test_value"
+    # Numbers may come back as float on 1.x (proto Struct) -> tolerate both.
+    assert float(stored["n"]) == 1.0
+
+  def test_convert_a2a_request_empty_metadata_omitted(self):
+    """Empty request metadata must not add an ``a2a_metadata`` entry."""
+    empty_meta_msg = _compat.make_message(
+        message_id="m1", role=_compat.ROLE_USER, parts=[]
+    )
+
+    mock_message = Mock()
+    mock_message.parts = []
+
+    request = Mock(spec=RequestContext)
+    request.message = mock_message
+    request.context_id = "ctx"
+    request.call_context = None
+    request.metadata = empty_meta_msg.metadata
+
+    result = convert_a2a_request_to_agent_run_request(request, Mock())
+
+    assert "a2a_metadata" not in result.run_config.custom_metadata
 
   def test_convert_a2a_request_no_message_raises_error(self):
     """Test that conversion raises ValueError when message is None."""

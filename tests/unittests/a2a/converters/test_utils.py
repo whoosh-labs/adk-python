@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,30 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-
+from google.adk.a2a.converters.utils import _from_a2a_context_id
+from google.adk.a2a.converters.utils import _get_adk_metadata_key
+from google.adk.a2a.converters.utils import _to_a2a_context_id
+from google.adk.a2a.converters.utils import ADK_CONTEXT_ID_PREFIX
+from google.adk.a2a.converters.utils import ADK_METADATA_KEY_PREFIX
 import pytest
-
-# Skip all tests in this module if Python version is less than 3.10
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 10), reason="A2A requires Python 3.10+"
-)
-
-# Import dependencies with version checking
-try:
-  from google.adk.a2a.converters.utils import _from_a2a_context_id
-  from google.adk.a2a.converters.utils import _get_adk_metadata_key
-  from google.adk.a2a.converters.utils import _to_a2a_context_id
-  from google.adk.a2a.converters.utils import ADK_CONTEXT_ID_PREFIX
-  from google.adk.a2a.converters.utils import ADK_METADATA_KEY_PREFIX
-except ImportError as e:
-  if sys.version_info < (3, 10):
-    # Imports are not needed since tests will be skipped due to pytestmark.
-    # The imported names are only used within test methods, not at module level,
-    # so no NameError occurs during module compilation.
-    pass
-  else:
-    raise e
 
 
 class TestUtilsFunctions:
@@ -130,7 +112,7 @@ class TestUtilsFunctions:
 
     result = _to_a2a_context_id(app_name, user_id, session_id)
 
-    expected = f"{ADK_CONTEXT_ID_PREFIX}/test-app@2024/user_123/session-456"
+    expected = f"{ADK_CONTEXT_ID_PREFIX}/test-app%402024/user_123/session-456"
     assert result == expected
 
   def test_from_a2a_context_id_success(self):
@@ -220,3 +202,29 @@ class TestUtilsFunctions:
     assert app_name == "test-app@2024"
     assert user_id == "user_123"
     assert session_id == "session-456"
+
+  @pytest.mark.parametrize(
+      "app_name, user_id, session_id",
+      [
+          ("app", "user", "projects/p/sessions/s"),
+          ("app", "projects/p/subscriptions/sub", "session"),
+          ("apps/a/versions/v", "user", "session"),
+          ("app", "user", "a/b/c"),
+      ],
+  )
+  def test_roundtrip_context_id_with_separator_in_ids(
+      self, app_name, user_id, session_id
+  ):
+    """Test roundtrip conversion when ids contain the separator character.
+
+    App names, user ids and session ids can legitimately contain the separator
+    (for example fully-qualified resource paths). The context id must still
+    round-trip so A2A session resolution does not silently fail.
+    """
+    context_id = _to_a2a_context_id(app_name, user_id, session_id)
+
+    parsed_app, parsed_user, parsed_session = _from_a2a_context_id(context_id)
+
+    assert parsed_app == app_name
+    assert parsed_user == user_id
+    assert parsed_session == session_id

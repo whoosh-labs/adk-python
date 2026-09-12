@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 from typing import Optional
 
 from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.models.llm_request import LlmRequest
@@ -383,6 +384,137 @@ async def test_no_duplicate_prefixing():
   original_tools = await toolset.get_tools()
   assert original_tools[0].name == 'original'
 
-  # The prefixed tools should be different instances
-  assert prefixed_tools_1[0] is not prefixed_tools_2[0]
+  # The prefixed tools should be the same instance when cached
+  assert prefixed_tools_1[0] is prefixed_tools_2[0]
   assert prefixed_tools_1[0] is not original_tools[0]
+
+
+@pytest.mark.asyncio
+async def test_get_tools_with_prefix_caching():
+  """Test that get_tools_with_prefix caches results within the same invocation."""
+  tool1 = _TestingTool(name='tool1', description='Test tool 1')
+  toolset = _TestingToolset(tools=[tool1], tool_name_prefix='test')
+
+  session_service = InMemorySessionService()
+  session = await session_service.create_session(
+      app_name='test_app', user_id='test_user'
+  )
+  agent = SequentialAgent(name='test_agent')
+  invocation_context1 = InvocationContext(
+      invocation_id='inv-1',
+      agent=agent,
+      session=session,
+      session_service=session_service,
+  )
+  readonly_context1 = ReadonlyContext(invocation_context1)
+
+  # First call
+  tools1 = await toolset.get_tools_with_prefix(
+      readonly_context=readonly_context1
+  )
+  assert len(tools1) == 1
+  assert tools1[0].name == 'test_tool1'
+
+  # Second call with same context/invocation_id
+  tools2 = await toolset.get_tools_with_prefix(
+      readonly_context=readonly_context1
+  )
+  assert len(tools2) == 1
+  assert (
+      tools2 is tools1
+  )  # Should return the exact same list instance (from cache)
+
+  # Third call with different invocation_id
+  invocation_context2 = InvocationContext(
+      invocation_id='inv-2',
+      agent=agent,
+      session=session,
+      session_service=session_service,
+  )
+  readonly_context2 = ReadonlyContext(invocation_context2)
+
+  tools3 = await toolset.get_tools_with_prefix(
+      readonly_context=readonly_context2
+  )
+  assert len(tools3) == 1
+  assert tools3 is not tools1  # Should be a new list instance
+  assert tools3[0].name == 'test_tool1'
+
+  # Test disabling caching
+  toolset._use_invocation_cache = False
+  tools4 = await toolset.get_tools_with_prefix(
+      readonly_context=readonly_context2
+  )
+  tools5 = await toolset.get_tools_with_prefix(
+      readonly_context=readonly_context2
+  )
+  assert tools4 is not tools5
+
+
+@pytest.mark.asyncio
+async def test_get_tools_override_can_replace_a_failed_listing():
+  """A subclass can catch its own listing failure and contribute placeholders."""
+
+  class _FailingToolset(_TestingToolset):
+
+    async def get_tools(
+        self, readonly_context: Optional[ReadonlyContext] = None
+    ) -> list[BaseTool]:
+      raise ConnectionError('HTTP 401 Unauthorized')
+
+  class _OAuthPromptingToolset(_FailingToolset):
+
+    async def get_tools(
+        self, readonly_context: Optional[ReadonlyContext] = None
+    ) -> list[BaseTool]:
+      try:
+        return await super().get_tools(readonly_context)
+      except ConnectionError as e:
+        return [_TestingTool(name='connect', description=f'Authorize ({e})')]
+
+  with pytest.raises(ConnectionError):
+    await _FailingToolset().get_tools_with_prefix()
+
+  tools = await _OAuthPromptingToolset(
+      tool_name_prefix='mcp'
+  ).get_tools_with_prefix()
+
+  assert len(tools) == 1
+  assert tools[0].name == 'mcp_connect'
+  assert tools[0].description == 'Authorize (HTTP 401 Unauthorized)'
+
+
+@pytest.mark.asyncio
+async def test_canonical_tools_resolves_placeholders_from_overridden_toolset():
+  """LlmAgent.canonical_tools integrates placeholders from an overridden toolset."""
+
+  class _FailingToolset(_TestingToolset):
+
+    async def get_tools(
+        self, readonly_context: Optional[ReadonlyContext] = None
+    ) -> list[BaseTool]:
+      raise ConnectionError('HTTP 401 Unauthorized')
+
+  class _OAuthPromptingToolset(_FailingToolset):
+
+    async def get_tools(
+        self, readonly_context: Optional[ReadonlyContext] = None
+    ) -> list[BaseTool]:
+      try:
+        return await super().get_tools(readonly_context)
+      except ConnectionError as e:
+        return [_TestingTool(name='connect', description=f'Authorize ({e})')]
+
+  agent = LlmAgent(
+      name='test_agent',
+      model='gemini-pro',
+      tools=[
+          _FailingToolset(),
+          _OAuthPromptingToolset(tool_name_prefix='mcp'),
+      ],
+  )
+  tools = await agent.canonical_tools()
+
+  assert len(tools) == 1
+  assert tools[0].name == 'mcp_connect'
+  assert tools[0].description == 'Authorize (HTTP 401 Unauthorized)'

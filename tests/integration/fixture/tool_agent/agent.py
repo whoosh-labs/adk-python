@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -107,7 +107,7 @@ test_case_retrieval = FilesRetrieval(
 valid_rag_retrieval = VertexAiRagRetrieval(
     name="valid_rag_retrieval",
     rag_corpora=[
-        "projects/1096655024998/locations/us-central1/ragCorpora/4985766262475849728"
+        "projects/123456789/locations/us-central1/ragCorpora/1234567890"
     ],
     description="General guidance for agent test cases",
 )
@@ -115,16 +115,14 @@ valid_rag_retrieval = VertexAiRagRetrieval(
 invalid_rag_retrieval = VertexAiRagRetrieval(
     name="invalid_rag_retrieval",
     rag_corpora=[
-        "projects/1096655024998/locations/us-central1/InValidRagCorporas/4985766262475849728"
+        "projects/123456789/locations/us-central1/InValidRagCorporas/1234567890"
     ],
     description="Invalid rag retrieval resource name",
 )
 
 non_exist_rag_retrieval = VertexAiRagRetrieval(
     name="non_exist_rag_retrieval",
-    rag_corpora=[
-        "projects/1096655024998/locations/us-central1/RagCorpora/1234567"
-    ],
+    rag_corpora=["projects/123456789/locations/us-central1/RagCorpora/1234567"],
     description="Non exist rag retrieval resource name",
 )
 
@@ -137,14 +135,14 @@ docs_tool = CrewaiTool(
 )
 
 no_schema_agent = Agent(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash",
     name="no_schema_agent",
     instruction="""Just say 'Hi'
 """,
 )
 
 schema_agent = Agent(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash",
     name="schema_agent",
     instruction="""
     You will be given a test case.
@@ -155,7 +153,7 @@ schema_agent = Agent(
 )
 
 no_input_schema_agent = Agent(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash",
     name="no_input_schema_agent",
     instruction="""
     Just return ['Tools_success, Tools_failure']
@@ -164,7 +162,7 @@ no_input_schema_agent = Agent(
 )
 
 no_output_schema_agent = Agent(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash",
     name="no_output_schema_agent",
     instruction="""
     Just say 'Hi'
@@ -173,7 +171,7 @@ no_output_schema_agent = Agent(
 )
 
 single_function_agent = Agent(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash",
     name="single_function_agent",
     description="An agent that calls a single function",
     instruction="When calling tools, just return what the tool returns.",
@@ -181,7 +179,7 @@ single_function_agent = Agent(
 )
 
 root_agent = Agent(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash",
     name="tool_agent",
     description="An agent that can call other tools",
     instruction="When calling tools, just return what the tool returns.",

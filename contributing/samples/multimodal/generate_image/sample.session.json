@@ -1,0 +1,217 @@
+{
+  "id": "xtgNTCtR",
+  "appName": "generate_image",
+  "userId": "test_user",
+  "state": {},
+  "events": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "a dog"
+          }
+        ],
+        "role": "user"
+      },
+      "invocationId": "CFs9iCdD",
+      "author": "user",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {},
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "LaWhnoSs",
+      "timestamp": 1730874845.9344919
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "args": {
+                "prompt": "a dog"
+              },
+              "name": "generate_image"
+            }
+          }
+        ],
+        "role": "model"
+      },
+      "invocationId": "CFs9iCdD",
+      "author": "root_agent",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {},
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "urXUWHfc",
+      "timestamp": 1730874850.6203258
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "generate_image",
+              "response": {
+                "status": "ok"
+              }
+            }
+          }
+        ],
+        "role": "user"
+      },
+      "invocationId": "CFs9iCdD",
+      "author": "root_agent",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {
+          "image.png": 0
+        },
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "v92aRpZL",
+      "timestamp": 1730874850.6219532
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "OK. I have generated an image of a dog. \n"
+          }
+        ],
+        "role": "model"
+      },
+      "invocationId": "CFs9iCdD",
+      "author": "root_agent",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {},
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "vxNenxyu",
+      "timestamp": 1730874850.9896104
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "add a duck"
+          }
+        ],
+        "role": "user"
+      },
+      "invocationId": "IGkazcuO",
+      "author": "user",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {},
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "SDVijPil",
+      "timestamp": 1730874854.9803195
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "args": {
+                "prompt": "a dog and a duck"
+              },
+              "name": "generate_image"
+            }
+          }
+        ],
+        "role": "model"
+      },
+      "invocationId": "IGkazcuO",
+      "author": "root_agent",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {},
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "fqFlqdNL",
+      "timestamp": 1730874858.7940624
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "generate_image",
+              "response": {
+                "status": "ok"
+              }
+            }
+          }
+        ],
+        "role": "user"
+      },
+      "invocationId": "IGkazcuO",
+      "author": "root_agent",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {
+          "image.png": 1
+        },
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "WUyMzRsh",
+      "timestamp": 1730874858.7951808
+    },
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "OK. I have generated an image of a dog and a duck. \n"
+          }
+        ],
+        "role": "model"
+      },
+      "invocationId": "IGkazcuO",
+      "author": "root_agent",
+      "actions": {
+        "stateDelta": {},
+        "artifactDelta": {},
+        "requestedAuthConfigs": {},
+        "requestedToolConfirmations": {}
+      },
+      "nodeInfo": {
+        "path": ""
+      },
+      "id": "WD2LHmFA",
+      "timestamp": 1730874859.2492816
+    }
+  ],
+  "lastUpdateTime": 1730874859.2492816
+}

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,20 +22,31 @@ import logging
 import sqlite3
 import sys
 
-from google.adk.sessions import database_session_service as dss
 from google.adk.sessions import sqlite_session_service as sss
+from google.adk.sessions.migration import _schema_check_utils
+from google.adk.sessions.schemas import v0 as v0_schema
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 logger = logging.getLogger("google_adk." + __name__)
 
 
-def migrate(source_db_url: str, dest_db_path: str):
+def migrate(source_db_url: str, dest_db_path: str) -> None:
   """Migrates data from a SQLAlchemy-based SQLite DB to the new schema."""
-  logger.info(f"Connecting to source database: {source_db_url}")
+  # Convert async driver URLs to sync URLs for SQLAlchemy's synchronous engine.
+  # This allows users to provide URLs like 'sqlite+aiosqlite://...' and have
+  # them automatically converted to 'sqlite://...' for migration.
+  source_sync_url = _schema_check_utils.to_sync_url(source_db_url)
+
+  logger.info(
+      "Connecting to source database: %s",
+      _schema_check_utils._redact_db_url(source_db_url),
+  )
   try:
-    engine = create_engine(source_db_url)
-    dss.Base.metadata.create_all(engine)  # Ensure tables exist for inspection
+    engine = create_engine(source_sync_url)
+    v0_schema.Base.metadata.create_all(
+        engine
+    )  # Ensure tables exist for inspection
     SourceSession = sessionmaker(bind=engine)
     source_session = SourceSession()
   except Exception as e:
@@ -55,59 +66,63 @@ def migrate(source_db_url: str, dest_db_path: str):
   try:
     # Migrate app_states
     logger.info("Migrating app_states...")
-    app_states = source_session.query(dss.StorageAppState).all()
-    for item in app_states:
+    app_states = source_session.query(v0_schema.StorageAppState).all()
+    for app_state in app_states:
       dest_cursor.execute(
           "INSERT INTO app_states (app_name, state, update_time) VALUES (?,"
           " ?, ?)",
           (
-              item.app_name,
-              json.dumps(item.state),
-              item.update_time.replace(tzinfo=timezone.utc).timestamp(),
+              app_state.app_name,
+              json.dumps(app_state.state),
+              app_state.update_time.replace(tzinfo=timezone.utc).timestamp(),
           ),
       )
     logger.info(f"Migrated {len(app_states)} app_states.")
 
     # Migrate user_states
     logger.info("Migrating user_states...")
-    user_states = source_session.query(dss.StorageUserState).all()
-    for item in user_states:
+    user_states = source_session.query(v0_schema.StorageUserState).all()
+    for user_state in user_states:
       dest_cursor.execute(
           "INSERT INTO user_states (app_name, user_id, state, update_time)"
           " VALUES (?, ?, ?, ?)",
           (
-              item.app_name,
-              item.user_id,
-              json.dumps(item.state),
-              item.update_time.replace(tzinfo=timezone.utc).timestamp(),
+              user_state.app_name,
+              user_state.user_id,
+              json.dumps(user_state.state),
+              user_state.update_time.replace(tzinfo=timezone.utc).timestamp(),
           ),
       )
     logger.info(f"Migrated {len(user_states)} user_states.")
 
     # Migrate sessions
     logger.info("Migrating sessions...")
-    sessions = source_session.query(dss.StorageSession).all()
-    for item in sessions:
+    sessions = source_session.query(v0_schema.StorageSession).all()
+    for storage_session in sessions:
       dest_cursor.execute(
           "INSERT INTO sessions (app_name, user_id, id, state, create_time,"
           " update_time) VALUES (?, ?, ?, ?, ?, ?)",
           (
-              item.app_name,
-              item.user_id,
-              item.id,
-              json.dumps(item.state),
-              item.create_time.replace(tzinfo=timezone.utc).timestamp(),
-              item.update_time.replace(tzinfo=timezone.utc).timestamp(),
+              storage_session.app_name,
+              storage_session.user_id,
+              storage_session.id,
+              json.dumps(storage_session.state),
+              storage_session.create_time.replace(
+                  tzinfo=timezone.utc
+              ).timestamp(),
+              storage_session.update_time.replace(
+                  tzinfo=timezone.utc
+              ).timestamp(),
           ),
       )
     logger.info(f"Migrated {len(sessions)} sessions.")
 
     # Migrate events
     logger.info("Migrating events...")
-    events = source_session.query(dss.StorageEvent).all()
-    for item in events:
+    events = source_session.query(v0_schema.StorageEvent).all()
+    for storage_event in events:
       try:
-        event_obj = item.to_event()
+        event_obj = storage_event.to_event()
         event_data = event_obj.model_dump_json(exclude_none=True)
         dest_cursor.execute(
             "INSERT INTO events (id, app_name, user_id, session_id,"
@@ -115,16 +130,16 @@ def migrate(source_db_url: str, dest_db_path: str):
             " ?, ?)",
             (
                 event_obj.id,
-                item.app_name,
-                item.user_id,
-                item.session_id,
+                storage_event.app_name,
+                storage_event.user_id,
+                storage_event.session_id,
                 event_obj.invocation_id,
                 event_obj.timestamp,
                 event_data,
             ),
         )
       except Exception as e:
-        logger.warning(f"Failed to migrate event {item.id}: {e}")
+        logger.warning(f"Failed to migrate event {storage_event.id}: {e}")
     logger.info(f"Migrated {len(events)} events.")
 
     dest_conn.commit()

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ from unittest.mock import Mock
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.base_agent import BaseAgentState
 from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.invocation_context import LlmCallsLimitExceededError
+from google.adk.agents.run_config import RunConfig
 from google.adk.apps import ResumabilityConfig
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
@@ -24,6 +26,7 @@ from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.session import Session
 from google.genai.types import Content
 from google.genai.types import FunctionCall
+from google.genai.types import FunctionResponse
 from google.genai.types import Part
 import pytest
 
@@ -127,6 +130,45 @@ class TestInvocationContext:
     assert not events
 
 
+class TestInvocationContextInitialization:
+  """Test suite for InvocationContext initialization."""
+
+  def test_custom_metadata_propagation(self):
+    """Tests that custom_metadata from RunConfig is propagated to InvocationContext."""
+    run_cfg = RunConfig(custom_metadata={'test_key': 'test_value'})
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        run_config=run_cfg,
+    )
+    # Access private attribute to verify
+    assert inv_ctx._custom_metadata == {'test_key': 'test_value'}
+
+  def test_custom_metadata_default_empty(self):
+    """Tests that _custom_metadata is empty by default when no RunConfig is provided."""
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+    )
+    assert inv_ctx._custom_metadata == {}
+
+  def test_custom_metadata_empty_run_config(self):
+    """Tests that _custom_metadata is empty when RunConfig has no custom_metadata."""
+    run_cfg = RunConfig()
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        run_config=run_cfg,
+    )
+    assert inv_ctx._custom_metadata == {}
+
+
 class TestInvocationContextWithAppResumablity:
   """Test suite for InvocationContext regarding app resumability."""
 
@@ -152,14 +194,14 @@ class TestInvocationContextWithAppResumablity:
     )
 
   def _create_test_invocation_context(
-      self, resumability_config
+      self, resumability_config: ResumabilityConfig | None = None
   ) -> InvocationContext:
     """Create a mock invocation context for testing."""
     ctx = InvocationContext(
         session_service=Mock(spec=BaseSessionService),
         agent=Mock(spec=BaseAgent),
         invocation_id='inv_1',
-        session=Mock(spec=Session),
+        session=Mock(spec=Session, events=[]),
         resumability_config=resumability_config,
     )
     return ctx
@@ -172,15 +214,13 @@ class TestInvocationContextWithAppResumablity:
 
     assert mock_invocation_context.should_pause_invocation(event_to_pause)
 
-  def test_should_not_pause_invocation_with_non_resumable_app(
-      self, event_to_pause
-  ):
-    """Tests should_pause_invocation with a non-resumable app."""
+  def test_should_pause_invocation_with_non_resumable_app(self, event_to_pause):
+    """Tests should_pause_invocation pauses even without resumability."""
     invocation_context = self._create_test_invocation_context(
         ResumabilityConfig(is_resumable=False)
     )
 
-    assert not invocation_context.should_pause_invocation(event_to_pause)
+    assert invocation_context.should_pause_invocation(event_to_pause)
 
   def test_should_not_pause_invocation_with_no_long_running_tool_ids(
       self, event_to_pause
@@ -209,6 +249,69 @@ class TestInvocationContextWithAppResumablity:
     assert not mock_invocation_context.should_pause_invocation(
         nonpausable_event
     )
+
+  def test_should_not_pause_when_user_resumes_in_sub_branch(
+      self, event_to_pause, long_running_function_call
+  ):
+    """We do not pause the invocation if a subsequent user event belongs to a sub-branch."""
+    # Arrange
+    mock_invocation_context = self._create_test_invocation_context()
+    user_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        branch=f'agent@{long_running_function_call.id}.child',
+    )
+    mock_invocation_context.session.events = [event_to_pause, user_event]
+
+    # Act
+    should_pause = mock_invocation_context.should_pause_invocation(
+        event_to_pause
+    )
+
+    # Assert
+    assert not should_pause
+
+  def test_should_not_pause_when_user_resumes_in_deeply_nested_sub_branch(
+      self, event_to_pause, long_running_function_call
+  ):
+    """We do not pause if the user resumes in a deeply nested sub-branch containing the tool call."""
+    # Arrange
+    mock_invocation_context = self._create_test_invocation_context()
+    user_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        branch=f'parent@other.child@{long_running_function_call.id}.grandchild',
+    )
+    mock_invocation_context.session.events = [event_to_pause, user_event]
+
+    # Act
+    should_pause = mock_invocation_context.should_pause_invocation(
+        event_to_pause
+    )
+
+    # Assert
+    assert not should_pause
+
+  def test_should_pause_when_user_resumes_in_different_branch(
+      self, event_to_pause
+  ):
+    """We still pause the invocation if the subsequent user event belongs to a different branch."""
+    # Arrange
+    mock_invocation_context = self._create_test_invocation_context()
+    user_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        branch='parent@different_id.child',
+    )
+    mock_invocation_context.session.events = [event_to_pause, user_event]
+
+    # Act
+    should_pause = mock_invocation_context.should_pause_invocation(
+        event_to_pause
+    )
+
+    # Assert
+    assert should_pause
 
   def test_is_resumable_true(self):
     """Tests that is_resumable is True when resumability is enabled."""
@@ -312,7 +415,9 @@ class TestInvocationContextWithAppResumablity:
     )
     invocation_context.session.events = [event]
     invocation_context.populate_invocation_agent_states()
-    assert invocation_context.agent_states == {'agent1': BaseAgentState()}
+    assert invocation_context.agent_states == {
+        'agent1': BaseAgentState().model_dump(mode='json')
+    }
     assert invocation_context.end_of_agents == {'agent1': False}
 
   def test_populate_invocation_agent_states_user_message_event(self):
@@ -534,3 +639,335 @@ class TestFindMatchingFunctionCall:
     invocation_context = test_invocation_context([fc_event, fr_event])
     match = invocation_context._find_matching_function_call(fr_event_no_fr)
     assert match is None
+
+  def test_stamp_event_branch_context_preserves_isolation_scope(
+      self, test_invocation_context
+  ):
+    """Tests stamp_event_branch_context does not overwrite existing isolation_scope with None."""
+    fc = Part.from_function_call(name='some_tool', args={})
+    fc.function_call.id = 'test_function_call_id'
+    fc_event = Event(
+        invocation_id='inv_1',
+        author='agent',
+        branch='root@1',
+        isolation_scope=None,  # Coordinator FC has None scope
+        content=testing_utils.ModelContent([fc]),
+    )
+    fr = Part.from_function_response(
+        name='some_tool', response={'result': 'ok'}
+    )
+    fr.function_response.id = 'test_function_call_id'
+    fr_event = Event(
+        invocation_id='inv_1',
+        author='agent',
+        isolation_scope='task_123',  # Pre-populated active task scope
+        content=Content(role='user', parts=[fr]),
+    )
+    invocation_context = test_invocation_context([fc_event, fr_event])
+
+    invocation_context.stamp_event_branch_context(fr_event)
+    assert fr_event.branch == 'root@1'
+    assert fr_event.isolation_scope == 'task_123'
+
+  def test_stamp_event_branch_context_does_not_overwrite_existing_scope(
+      self, test_invocation_context
+  ):
+    """Tests stamp_event_branch_context does not overwrite existing isolation_scope if set."""
+    fc = Part.from_function_call(name='some_tool', args={})
+    fc.function_call.id = 'test_function_call_id'
+    fc_event = Event(
+        invocation_id='inv_1',
+        author='agent',
+        branch='root@1',
+        isolation_scope='task_456',  # Function call has isolation scope
+        content=testing_utils.ModelContent([fc]),
+    )
+    fr = Part.from_function_response(
+        name='some_tool', response={'result': 'ok'}
+    )
+    fr.function_response.id = 'test_function_call_id'
+    fr_event = Event(
+        invocation_id='inv_1',
+        author='agent',
+        isolation_scope='task_123',  # Pre-populated active task scope
+        content=Content(role='user', parts=[fr]),
+    )
+    invocation_context = test_invocation_context([fc_event, fr_event])
+
+    invocation_context.stamp_event_branch_context(fr_event)
+    assert fr_event.branch == 'root@1'
+    assert fr_event.isolation_scope == 'task_123'
+
+  def test_find_matching_function_call_when_response_is_not_last_event(
+      self, test_invocation_context
+  ):
+    """Tests that matching function call is found even when response is not the last event in history."""
+    fc = Part.from_function_call(name='some_tool', args={})
+    fc.function_call.id = 'test_function_call_id'
+    fc_event = Event(
+        invocation_id='inv_1',
+        author='agent',
+        content=testing_utils.ModelContent([fc]),
+    )
+    fr = Part.from_function_response(
+        name='some_tool', response={'result': 'ok'}
+    )
+    fr.function_response.id = 'test_function_call_id'
+    fr_event = Event(
+        invocation_id='inv_1',
+        author='agent',
+        content=Content(role='user', parts=[fr]),
+    )
+    # Add a subsequent event to the history so that fr_event is NOT the last one
+    subsequent_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        content=Content(role='user', parts=[Part(text='next user message')]),
+    )
+    invocation_context = test_invocation_context(
+        [fc_event, fr_event, subsequent_event]
+    )
+
+    matching_fc_event = invocation_context._find_matching_function_call(
+        fr_event
+    )
+    assert testing_utils.simplify_content(
+        matching_fc_event.content
+    ) == testing_utils.simplify_content(fc_event.content)
+
+
+class TestIncrementLlmCallCount:
+  """Test suite for InvocationContext.increment_llm_call_count."""
+
+  def _context(self, run_config=None):
+    kwargs = {} if run_config is None else {'run_config': run_config}
+    return InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        **kwargs,
+    )
+
+  def test_allows_exactly_max_llm_calls_then_raises(self):
+    """The limit is the number of calls allowed, not the count before it."""
+    ctx = self._context(RunConfig(max_llm_calls=2))
+
+    ctx.increment_llm_call_count()
+    ctx.increment_llm_call_count()
+
+    with pytest.raises(LlmCallsLimitExceededError, match='limit of `2`'):
+      ctx.increment_llm_call_count()
+
+  def test_keeps_raising_once_the_limit_is_passed(self):
+    """The limit latches: a caller cannot swallow one error and carry on."""
+    ctx = self._context(RunConfig(max_llm_calls=1))
+    ctx.increment_llm_call_count()
+
+    with pytest.raises(LlmCallsLimitExceededError):
+      ctx.increment_llm_call_count()
+    with pytest.raises(LlmCallsLimitExceededError):
+      ctx.increment_llm_call_count()
+
+  @pytest.mark.parametrize('max_llm_calls', [0, -1])
+  def test_non_positive_limit_is_not_enforced(self, max_llm_calls: int):
+    """A non-positive limit documents 'no enforcement', not 'no calls'."""
+    ctx = self._context(RunConfig(max_llm_calls=max_llm_calls))
+
+    for _ in range(5):
+      ctx.increment_llm_call_count()
+
+  def test_without_run_config_the_limit_is_not_enforced(self):
+    """run_config is optional, so counting must tolerate its absence."""
+    ctx = self._context()
+    assert ctx.run_config is None
+
+    for _ in range(5):
+      ctx.increment_llm_call_count()
+
+  def test_count_is_per_invocation_context(self):
+    """Two invocations must not share a budget."""
+    first = self._context(RunConfig(max_llm_calls=1))
+    second = self._context(RunConfig(max_llm_calls=1))
+
+    first.increment_llm_call_count()
+    second.increment_llm_call_count()
+
+    with pytest.raises(LlmCallsLimitExceededError):
+      second.increment_llm_call_count()
+
+
+def _ctx_on_branch(branch, events):
+  """An InvocationContext on `branch` over a session holding `events`."""
+  return InvocationContext(
+      session_service=Mock(spec=BaseSessionService),
+      agent=Mock(spec=BaseAgent),
+      invocation_id='inv_1',
+      branch=branch,
+      session=Mock(spec=Session, events=events),
+  )
+
+
+def test_get_events_current_branch_includes_user_event_on_sub_branch():
+  """A user event from a descendant sub-branch belongs to this subtree."""
+  user_on_child = Event(
+      invocation_id='inv_1', author='user', branch='agent_1.child'
+  )
+  ctx = _ctx_on_branch('agent_1', [user_on_child])
+
+  assert ctx._get_events(current_branch=True) == [user_on_child]
+
+
+def test_get_events_current_branch_excludes_agent_event_on_sub_branch():
+  """A non-user event from a descendant sub-branch is not returned.
+
+  This is asymmetric with the user case above on purpose: widening it would
+  hand every caller a descendant's internal events. Pinned here so the
+  asymmetry is a stated contract rather than an accident.
+  """
+  agent_on_child = Event(
+      invocation_id='inv_1', author='some_agent', branch='agent_1.child'
+  )
+  ctx = _ctx_on_branch('agent_1', [agent_on_child])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_current_branch_excludes_sibling_branch():
+  """A sibling branch is never part of this subtree."""
+  user_on_sibling = Event(
+      invocation_id='inv_1', author='user', branch='agent_2'
+  )
+  ctx = _ctx_on_branch('agent_1', [user_on_sibling])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_empty_branch_does_not_match_every_branched_event():
+  """An empty branch must not behave like "match everything".
+
+  An empty string is a real branch value in the workflow code, and a bare
+  descendant test would treat every branched event as its descendant.
+  """
+  user_on_branch = Event(invocation_id='inv_1', author='user', branch='agent_1')
+  ctx = _ctx_on_branch('', [user_on_branch])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def _call_event(branch, call_id):
+  """A non-user event issuing function call `call_id` on `branch`."""
+  return Event(
+      invocation_id='inv_1',
+      author='some_agent',
+      branch=branch,
+      content=Content(
+          parts=[Part(function_call=FunctionCall(id=call_id, name='t'))]
+      ),
+  )
+
+
+def _user_response_event(branch, call_id):
+  """A user event answering function call `call_id` on `branch`."""
+  return Event(
+      invocation_id='inv_1',
+      author='user',
+      branch=branch,
+      content=Content(
+          parts=[
+              Part(
+                  function_response=FunctionResponse(
+                      id=call_id, name='t', response={}
+                  )
+              )
+          ]
+      ),
+  )
+
+
+def test_get_events_current_branch_keeps_user_response_to_a_call_here():
+  """A reply answering a call issued in this subtree is returned."""
+  call_here = _call_event('agent_1.child', 'fc_1')
+  reply = _user_response_event('agent_1', 'fc_1')
+  ctx = _ctx_on_branch('agent_1', [call_here, reply])
+
+  assert ctx._get_events(current_branch=True) == [reply]
+
+
+def test_get_events_current_branch_drops_user_response_to_a_call_elsewhere():
+  """Sitting on this branch is not enough for a reply to a foreign call.
+
+  The function-response gate is the only difference from the test above, so a
+  reply that answers a parallel tree's call is dropped even though its own
+  branch matches exactly.
+  """
+  call_elsewhere = _call_event('agent_2', 'fc_1')
+  reply = _user_response_event('agent_1', 'fc_1')
+  ctx = _ctx_on_branch('agent_1', [call_elsewhere, reply])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_current_branch_drops_user_response_to_a_lookalike_call():
+  """A branch that merely shares a prefix does not count as a sub-branch.
+
+  `agent_10` starts with `agent_1`, so a plain prefix test would read the call
+  as issued in this subtree and let the reply through.
+  """
+  call_on_lookalike = _call_event('agent_10', 'fc_1')
+  reply = _user_response_event('agent_1', 'fc_1')
+  ctx = _ctx_on_branch('agent_1', [call_on_lookalike, reply])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_without_a_branch_matches_every_user_event():
+  """A context with no branch sees user events wherever they sit.
+
+  Non-user events stay on the strict rule, so this also pins the asymmetry:
+  the agent event beside it is not returned.
+  """
+  user_elsewhere = Event(
+      invocation_id='inv_1', author='user', branch='agent_2.child'
+  )
+  agent_elsewhere = Event(
+      invocation_id='inv_1', author='some_agent', branch='agent_2.child'
+  )
+  ctx = _ctx_on_branch(None, [user_elsewhere, agent_elsewhere])
+
+  assert ctx._get_events(current_branch=True) == [user_elsewhere]
+
+
+def test_get_events_current_branch_filters_each_response_independently():
+  """Several replies on one branch are each judged against their own call.
+
+  The set of calls issued in this subtree is the same for every event, so it
+  is built once per call rather than rescanned per reply. This pins that the
+  shared set still discriminates: the reply to a foreign call is dropped while
+  the replies around it are kept.
+  """
+  call_here = _call_event('agent_1', 'fc_here')
+  call_on_child = _call_event('agent_1.child', 'fc_child')
+  call_elsewhere = _call_event('agent_2', 'fc_far')
+  reply_here = _user_response_event('agent_1', 'fc_here')
+  reply_far = _user_response_event('agent_1', 'fc_far')
+  reply_child = _user_response_event('agent_1', 'fc_child')
+  ctx = _ctx_on_branch(
+      'agent_1',
+      [
+          call_here,
+          call_on_child,
+          call_elsewhere,
+          reply_here,
+          reply_far,
+          reply_child,
+      ],
+  )
+
+  # `call_here` sits on exactly this branch, so the non-user rule returns it
+  # too; the two sub-branch calls do not.
+  assert ctx._get_events(current_branch=True) == [
+      call_here,
+      reply_here,
+      reply_child,
+  ]

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,13 +17,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field
 import os
-from typing import Optional
 
-from opentelemetry import _events
 from opentelemetry import _logs
 from opentelemetry import metrics
 from opentelemetry import trace
-from opentelemetry.sdk._events import EventLoggerProvider
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs import LogRecordProcessor
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
@@ -37,8 +34,6 @@ from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from ..utils.feature_decorator import experimental
-
 
 @dataclass
 class OTelHooks:
@@ -47,13 +42,11 @@ class OTelHooks:
   log_record_processors: list[LogRecordProcessor] = field(default_factory=list)
 
 
-@experimental()
 def maybe_set_otel_providers(
-    otel_hooks_to_setup: list[OTelHooks] = None,
-    otel_resource: Optional[Resource] = None,
-):
-  """Sets up OTel providers if hooks for a given telemetry type were
-  passed.
+    otel_hooks_to_setup: list[OTelHooks] | None = None,
+    otel_resource: Resource | None = None,
+) -> None:
+  """Sets up OTel providers if hooks for a given telemetry type were passed.
 
   Additionally adds generic OTLP exporters based on following env variables:
   OTEL_EXPORTER_OTLP_ENDPOINT
@@ -68,35 +61,32 @@ def maybe_set_otel_providers(
 
   Args:
     otel_hooks_to_setup: per-telemetry-type processors and readers to be added
-    to OTel providers. If no hooks for a specific telemetry type are passed -
-    provider will not be set.
-    otel_resource: OTel resource to use in providers.
-    If empty - default OTel resource detection will be used.
+      to OTel providers. If no hooks for a specific telemetry type are passed -
+      provider will not be set.
+    otel_resource: OTel resource to use in providers. If empty - default OTel
+      resource detection will be used.
   """
-  otel_hooks_to_setup = otel_hooks_to_setup or []
+  hooks_to_setup = list(otel_hooks_to_setup or ())
   otel_resource = otel_resource or _get_otel_resource()
 
   # Add generic OTel exporters based on OTel env variables.
-  otel_hooks_to_setup.append(_get_otel_exporters())
+  hooks_to_setup.append(_get_otel_exporters())
 
-  span_processors = []
-  metric_readers = []
-  log_record_processors = []
-  for otel_hooks in otel_hooks_to_setup:
-    for span_processor in otel_hooks.span_processors:
-      span_processors.append(span_processor)
-    for metric_reader in otel_hooks.metric_readers:
-      metric_readers.append(metric_reader)
-    for log_record_processor in otel_hooks.log_record_processors:
-      log_record_processors.append(log_record_processor)
+  span_processors: list[SpanProcessor] = []
+  metric_readers: list[MetricReader] = []
+  log_record_processors: list[LogRecordProcessor] = []
+  for otel_hooks in hooks_to_setup:
+    span_processors.extend(otel_hooks.span_processors)
+    metric_readers.extend(otel_hooks.metric_readers)
+    log_record_processors.extend(otel_hooks.log_record_processors)
 
   # Try to set up OTel tracing.
   # If the TracerProvider was already set outside of ADK, this would be a no-op
   # and results in a warning. In such case we rely on user setup.
   if span_processors:
     new_tracer_provider = TracerProvider(resource=otel_resource)
-    for exporter in span_processors:
-      new_tracer_provider.add_span_processor(exporter)
+    for span_processor in span_processors:
+      new_tracer_provider.add_span_processor(span_processor)
     trace.set_tracer_provider(new_tracer_provider)
 
   # Try to set up OTel metrics.
@@ -107,6 +97,8 @@ def maybe_set_otel_providers(
         MeterProvider(
             metric_readers=metric_readers,
             resource=otel_resource,
+            # Not collecting on exit to avoid points being collected too close together.
+            shutdown_on_exit=False,
         )
     )
 
@@ -114,15 +106,10 @@ def maybe_set_otel_providers(
   # If the LoggerProvider was already set outside of ADK, this would be a no-op
   # and results in a warning. In such case we rely on user setup.
   if log_record_processors:
-    new_logger_provider = LoggerProvider(
-        resource=otel_resource,
-    )
-    for exporter in log_record_processors:
-      new_logger_provider.add_log_record_processor(exporter)
+    new_logger_provider = LoggerProvider(resource=otel_resource)
+    for log_record_processor in log_record_processors:
+      new_logger_provider.add_log_record_processor(log_record_processor)
     _logs.set_logger_provider(new_logger_provider)
-    # Add event provider to logger provider to support gen_ai events.
-    event_logger_provider = EventLoggerProvider(new_logger_provider)
-    _events.set_event_logger_provider(event_logger_provider)
 
 
 def _get_otel_resource() -> Resource:
